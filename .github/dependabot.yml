@@ -1,0 +1,29 @@
+version: 2
+
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: CI
+    groups:
+      # One PR per weekly run for all action bumps, instead of one PR per action.
+      github-actions:
+        patterns:
+          - "*"
+
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: Update
+    groups:
+      # One PR per weekly run for routine bumps keeps the changelog auto-fill tidy.
+      package-dependencies:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch

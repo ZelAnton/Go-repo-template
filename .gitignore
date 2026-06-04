@@ -1,0 +1,71 @@
+## -------
+## Go build / test artifacts
+## Go has no standard build-output directory (binaries land in the current dir or
+## wherever `go build -o` points), so this ignores the usual loose outputs.
+## -------
+# Compiled binaries / plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+# Test binary built with `go test -c`
+*.test
+# Output of `go tool cover` and profiling
+*.out
+coverage.*
+# Go workspace files (per-developer; not committed)
+go.work
+go.work.sum
+# Vendored dependencies (uncomment if you do NOT commit `go mod vendor` output)
+# /vendor/
+
+## -------
+## Editors / IDEs
+## -------
+.vs/
+.vscode/
+!.vscode/extensions.json
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+*.code-workspace
+.history/
+.idea/
+
+## -------
+## Secrets / local config
+## -------
+.env
+.env.local
+
+## -------
+## macOS
+## -------
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+
+## -------
+## Windows
+## -------
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+## -------
+## Claude Code — ship the shared settings with the repo, even if a global
+## gitignore excludes .claude. Personal overrides stay ignored.
+## -------
+!.claude/
+.claude/*
+!.claude/settings.json
+!.claude/settings.json.template
+.claude/settings.local.json

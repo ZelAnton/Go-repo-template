@@ -1,0 +1,51 @@
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+# Default indentation for non-Go files (scripts, docs). Go itself is governed by
+# gofmt via the [*.go] block below.
+indent_style = space
+indent_size = 4
+tab_width = 4
+
+# Go source. gofmt mandates tabs for indentation — match it so editors don't
+# fight the formatter. gofmt owns the rest of the style; `gofmt -l` is the gate.
+[*.go]
+indent_style = tab
+indent_size = 4
+tab_width = 4
+
+# go.mod / go.sum use tab-aligned columns (`go mod tidy` writes them).
+[{go.mod,go.sum}]
+indent_style = tab
+tab_width = 4
+
+# JSON config (.claude settings, etc.).
+[*.json]
+indent_style = space
+indent_size = 2
+tab_width = 2
+
+# Windows batch files must have CRLF — CMD will not parse them otherwise.
+[*.{bat,cmd}]
+end_of_line = crlf
+tab_width = 2
+
+# PowerShell (the init scripts) — spaces, LF.
+[*.{ps1,psm1,psd1}]
+indent_style = space
+indent_size = 4
+tab_width = 4
+
+# YAML cannot use tabs.
+[*.{yaml,yml}]
+indent_style = space
+indent_size = 2
+tab_width = 2
+
+# Markdown — keep trailing whitespace (hard line breaks).
+[*.md]
+trim_trailing_whitespace = false

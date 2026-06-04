@@ -1,0 +1,396 @@
+name: Release
+
+# Manual release workflow for a Go module.
+#
+# Go modules have no registry credential and no version field in go.mod: a
+# release IS a git tag (`vX.Y.Z`). Pushing the tag is the publish — the Go module
+# proxy (proxy.golang.org) fetches the module at that tag on first request and the
+# version is then immutable forever. So the atomic tag push is this workflow's
+# single IRREVERSIBLE pivot; there is nothing to publish before it and no secret to
+# preflight.
+#
+# Shipped ENABLED but `workflow_dispatch`-only (no push/tag trigger), so it never
+# runs on its own — click "Run workflow" and pick a bump. The version is never
+# typed by hand: the latest `v*` tag drives the next number. The first release
+# (no `v*` tag yet) ships v0.1.0, ignoring the bump.
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: 'Version bump type (ignored on the first release)'
+        required: true
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+        default: 'patch'
+
+# Never run two releases at once — they both commit + tag the branch.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # push the release commit + tag, and create the Release
+    steps:
+      # RELEASE ORDERING INVARIANT (rationale repeated at each relevant step):
+      # the atomic tag push is the single IRREVERSIBLE step (once the proxy fetches
+      # the tag, that module version can never change), so it is the pivot.
+      # Everything before it is cheap and reversible (build/test, plus a LOCAL
+      # commit+tag that is not yet pushed); the only thing after it (the GitHub
+      # Release) is recreatable and is made idempotent + retried. A failure before
+      # the push leaves no trace on the remote or proxy — just re-run.
+      #
+      # The push targets `main`. If you protect `main` with a rule that requires
+      # pull requests or status checks, that push is rejected unless the pusher can
+      # bypass it. This workflow mints a short-lived GitHub App token (repo variable
+      # RELEASE_APP_ID + secret RELEASE_APP_PRIVATE_KEY) and checks out with it, so
+      # the push runs as the App — add that App to the ruleset's bypass list. Until
+      # it is configured the checkout falls back to GITHUB_TOKEN (fine while main is
+      # unprotected). Recipe: release-token-bypass.md.
+      # Actions are pinned to a full commit SHA (supply-chain hardening); the
+      # trailing comment records the human-readable version. Dependabot bumps the
+      # SHA and updates the comment on its weekly run.
+
+      - name: Guard — release only from main
+        run: |
+          set -euo pipefail
+          # Read the dispatch ref from $GITHUB_REF (not an interpolated expression) to
+          # avoid script injection via a crafted branch name. Standard Actions guard.
+          if [[ "$GITHUB_REF" != "refs/heads/main" ]]; then
+            echo "::error::Release must be dispatched from main (got: $GITHUB_REF). Re-run with 'Use workflow from: main'."
+            exit 1
+          fi
+          echo "Dispatched from main."
+
+      # Mint a short-lived GitHub App installation token so the push to `main` runs as
+      # the App (which sits in the branch-protection ruleset's bypass list). Skipped
+      # until RELEASE_APP_ID is set; then the push falls back to GITHUB_TOKEN. See
+      # release-token-bypass.md.
+      - name: Mint GitHub App token
+        id: app-token
+        if: ${{ vars.RELEASE_APP_ID != '' }}
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        with:
+          app-id: ${{ vars.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          ref: main
+          fetch-depth: 0 # full history + tags, for version math and git-cliff
+          token: ${{ steps.app-token.outputs.token || secrets.GITHUB_TOKEN }}
+
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.mod
+
+      - name: Determine next version
+        id: version
+        run: |
+          set -euo pipefail
+          # Newest version-sorted release tag. Use for-each-ref (--count=1) rather than
+          # `git tag --list ... | head -n1`: head closes the pipe after one line, which
+          # can SIGPIPE-abort `git tag` under `set -o pipefail` once the tag list exceeds
+          # the pipe buffer (~thousands of tags).
+          LATEST_TAG=$(git for-each-ref --count=1 --sort=-v:refname \
+            --format='%(refname:short)' 'refs/tags/v[0-9]*.[0-9]*.[0-9]*')
+          if [[ -n "$LATEST_TAG" ]]; then
+            CURRENT="${LATEST_TAG#v}"
+            if [[ ! "$CURRENT" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "::error::Could not parse current version from tag (got: '$CURRENT')"
+              exit 1
+            fi
+            IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
+            case "${{ inputs.bump }}" in
+              major) NEW="$((MAJOR+1)).0.0" ;;
+              minor) NEW="${MAJOR}.$((MINOR+1)).0" ;;
+              patch) NEW="${MAJOR}.${MINOR}.$((PATCH+1))" ;;
+            esac
+            echo "Latest release tag: $LATEST_TAG (current=$CURRENT); ${{ inputs.bump }} bump -> $NEW"
+            echo "first_release=false" >> "$GITHUB_OUTPUT"
+          else
+            # First release: Go has no version field in go.mod to seed from, so start
+            # at the conventional first tag. The bump input is ignored.
+            CURRENT="0.0.0"
+            NEW="0.1.0"
+            echo "No release tags found; seeding first release as v$NEW (bump input ignored)."
+            echo "first_release=true" >> "$GITHUB_OUTPUT"
+          fi
+          if [[ ! "$NEW" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Computed version '$NEW' is not a valid MAJOR.MINOR.PATCH semver."
+            exit 1
+          fi
+          echo "current=$CURRENT" >> "$GITHUB_OUTPUT"
+          echo "version=$NEW" >> "$GITHUB_OUTPUT"
+          echo "tag=v$NEW" >> "$GITHUB_OUTPUT"
+
+      - name: Verify tag does not exist
+        run: |
+          if git rev-parse "${{ steps.version.outputs.tag }}" >/dev/null 2>&1; then
+            echo "::error::Tag ${{ steps.version.outputs.tag }} already exists"
+            exit 1
+          fi
+
+      # git-cliff (next step) needs the previous tag locally to bound its commit range.
+      # When it is missing (synthetic v0.0.0 of a first release) create it locally and
+      # DO NOT push it — pushing would be a remote write before the pivot and would
+      # break first-release re-run safety.
+      - name: Ensure previous tag exists (local only)
+        env:
+          PREV_TAG: v${{ steps.version.outputs.current }}
+        run: |
+          set -euo pipefail
+          if git rev-parse "$PREV_TAG" >/dev/null 2>&1; then
+            echo "Previous tag $PREV_TAG already exists."
+            exit 0
+          fi
+          ROOT=$(git rev-list --max-parents=0 HEAD | tail -n1)
+          echo "Previous tag $PREV_TAG does not exist; creating it locally at root commit $ROOT (not pushed)."
+          git tag "$PREV_TAG" "$ROOT"
+
+      - name: Install git-cliff
+        uses: taiki-e/install-action@e49978b799e49ff429d162b7a30601a569ab6538 # v2
+        with:
+          tool: git-cliff@2
+
+      - name: Auto-fill [Unreleased] from git log if empty
+        env:
+          PREV_TAG: v${{ steps.version.outputs.current }}
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          import os
+          import pathlib
+          import re
+          import subprocess
+          import sys
+
+          prev_tag = os.environ["PREV_TAG"]
+          path = pathlib.Path("CHANGELOG.md")
+          text = path.read_text()
+
+          # Bound the body by the next version section, the reference-link block
+          # (`[Unreleased]: ...` / `[x.y.z]: ...`), or EOF. The link-block stop
+          # matters on a first release, where [Unreleased] is the last `##` section
+          # and the capture would otherwise swallow (and the auto-fill step would
+          # then delete) the trailing link definitions.
+          m = re.search(r"^## \[Unreleased\]\s*\n(.*?)(?=^## \[|^\[[^\]]+\]:|\Z)", text, re.M | re.S)
+          if not m:
+              print("::error::Could not find '## [Unreleased]' header in CHANGELOG.md", file=sys.stderr)
+              sys.exit(1)
+
+          body = m.group(1)
+          has_real_bullets = any(re.match(r"^-\s+\S", ln) for ln in body.splitlines())
+          if has_real_bullets:
+              print("[Unreleased] already has manual entries; skipping auto-fill.")
+              sys.exit(0)
+
+          print(f"[Unreleased] is empty; generating from git log since {prev_tag}...")
+          result = subprocess.run(
+              ["git-cliff", "--config", "cliff.toml", "--strip", "all", f"{prev_tag}..HEAD"],
+              check=True,
+              capture_output=True,
+              text=True,
+          )
+          generated = result.stdout.strip()
+          if not generated:
+              print(
+                  f"::error::No release-worthy commits found between {prev_tag} and HEAD. "
+                  "Either add a manual entry to [Unreleased] in CHANGELOG.md, or commit "
+                  "changes with a recognised prefix (Add/Fix/Refactor/Update/Remove/...).",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+
+          new_text = text[: m.start(1)] + generated + "\n\n" + text[m.end(1) :]
+          path.write_text(new_text)
+          print("----- auto-generated [Unreleased] body -----")
+          print(generated)
+          print("--------------------------------------------")
+          PY
+
+      # Curate release notes from [Unreleased] into $RUNNER_TEMP (outside the working
+      # tree, so it neither dirties the tree nor lands in any commit).
+      - name: Extract release notes from CHANGELOG.md
+        env:
+          NOTES_FILE: ${{ runner.temp }}/release-notes.md
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          import os
+          import pathlib
+          import re
+          import sys
+
+          text = pathlib.Path("CHANGELOG.md").read_text()
+          # Bound the body by the next version section, the reference-link block
+          # (`[Unreleased]: ...` / `[x.y.z]: ...`), or EOF. The link-block stop
+          # matters on a first release, where [Unreleased] is the last `##` section
+          # and the capture would otherwise swallow (and the auto-fill step would
+          # then delete) the trailing link definitions.
+          m = re.search(r"^## \[Unreleased\]\s*\n(.*?)(?=^## \[|^\[[^\]]+\]:|\Z)", text, re.M | re.S)
+          body = (m.group(1) if m else "").strip()
+
+          # Keep "### Header" only if it has at least one real bullet ("- text").
+          parts = re.split(r"(?m)(^### .+$)", body)
+          out = []
+          for i in range(1, len(parts), 2):
+              header = parts[i]
+              section = parts[i + 1] if i + 1 < len(parts) else ""
+              bullets = [ln for ln in section.splitlines() if re.match(r"^-\s+\S", ln)]
+              if bullets:
+                  if out:
+                      out.append("")
+                  out.append(header)
+                  out.extend(bullets)
+
+          result = "\n".join(out).strip()
+          if not result:
+              print(
+                  "::error::[Unreleased] section in CHANGELOG.md is empty. "
+                  "Add release notes before releasing.",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+
+          pathlib.Path(os.environ["NOTES_FILE"]).write_text(result + "\n")
+          print("----- release notes -----")
+          print(result)
+          print("-------------------------")
+          PY
+
+      # Gate: build, vet, and test before the irreversible tag push. There are no
+      # downloadable artifacts to package — a Go module is published as source by the
+      # tag itself — so this step only proves the tagged commit is sound.
+      - name: Build, vet, and test
+        run: |
+          set -euo pipefail
+          go build ./...
+          go vet ./...
+          go test -race ./...
+
+      - name: Promote Unreleased section in CHANGELOG.md
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          TAG: ${{ steps.version.outputs.tag }}
+          PREV_TAG: v${{ steps.version.outputs.current }}
+          FIRST_RELEASE: ${{ steps.version.outputs.first_release }}
+          REPO: ${{ github.server_url }}/${{ github.repository }}
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          import os
+          import pathlib
+          import re
+          import sys
+          from datetime import datetime, timezone
+
+          version = os.environ["VERSION"]
+          tag = os.environ["TAG"]
+          prev_tag = os.environ["PREV_TAG"]
+          first_release = os.environ.get("FIRST_RELEASE") == "true"
+          repo = os.environ["REPO"]
+          date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+          path = pathlib.Path("CHANGELOG.md")
+          text = path.read_text()
+
+          new_unreleased = (
+              "## [Unreleased]\n\n"
+              "### Added\n-\n\n"
+              "### Changed\n-\n\n"
+              "### Fixed\n-\n\n"
+              f"## [{version}] - {date}"
+          )
+          text, n = re.subn(r"^## \[Unreleased\][ \t]*$", new_unreleased, text, count=1, flags=re.M)
+          if n != 1:
+              print("::error::Could not find '## [Unreleased]' header in CHANGELOG.md", file=sys.stderr)
+              sys.exit(1)
+
+          # On the first release the previous tag (v0.0.0) is synthetic — created
+          # locally to bound git-cliff and never pushed — so a compare link against
+          # it would 404. Point the first version at its own tag instead.
+          if first_release:
+              versioned_link = f"[{version}]: {repo}/releases/tag/{tag}"
+          else:
+              versioned_link = f"[{version}]: {repo}/compare/{prev_tag}...{tag}"
+          link_replacement = (
+              f"[Unreleased]: {repo}/compare/{tag}...HEAD\n"
+              + versioned_link
+          )
+          text, n = re.subn(r"^\[Unreleased\]:.*$", link_replacement, text, count=1, flags=re.M)
+          if n != 1:
+              print("::error::Could not find '[Unreleased]: ...' reference link in CHANGELOG.md", file=sys.stderr)
+              sys.exit(1)
+
+          path.write_text(text)
+          PY
+
+      # Create the release commit and tag LOCALLY, but do NOT push yet: the push is
+      # the irreversible pivot below. Go has no manifest version to bump, so only the
+      # changelog is committed.
+      - name: Commit and tag the release (local only)
+        run: |
+          set -euo pipefail
+          git config user.name "__Author__"
+          git config user.email "__AuthorEmail__"
+          git add CHANGELOG.md
+          git commit -m "Release ${{ steps.version.outputs.tag }}"
+          git tag "${{ steps.version.outputs.tag }}"
+
+      # === PIVOT: the single irreversible step ===
+      # Pushing the tag publishes the module: proxy.golang.org fetches it on first
+      # request and the version is then immutable. It runs only after build/test
+      # passed; a failure here leaves no tag on the remote, so a re-run is safe and
+      # recomputes the SAME version. --atomic guarantees the branch and tag move
+      # together (or neither does) — a non-atomic push that advanced main but dropped
+      # the tag would make the next run bump from the already-committed state.
+      - name: Push the release commit + tag (atomic — publishes the module)
+        run: git push --atomic origin HEAD:refs/heads/main "${{ steps.version.outputs.tag }}"
+
+      # Final, recreatable step, made idempotent (edit the Release if it already
+      # exists, else create it) and retried. A Go module has no downloadable
+      # artifacts, so the Release carries the curated notes only.
+      - name: Create or update the GitHub Release (idempotent)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.version.outputs.tag }}
+          NOTES_FILE: ${{ runner.temp }}/release-notes.md
+        run: |
+          set -uo pipefail
+          attempt=0
+          max=3
+          while :; do
+            attempt=$((attempt + 1))
+            if gh release view "$TAG" >/dev/null 2>&1; then
+              gh release edit "$TAG" --title "$TAG" --notes-file "$NOTES_FILE" && break
+            else
+              gh release create "$TAG" --title "$TAG" --notes-file "$NOTES_FILE" && break
+            fi
+            if [ "$attempt" -ge "$max" ]; then
+              echo "::error::${TAG} is PUSHED (the module is published) but creating the GitHub Release failed. Finish it by hand: 'gh release create ${TAG} --notes-file <notes>'. Do NOT re-run this workflow — it would bump to the next version and strand ${TAG}'s release."
+              exit 1
+            fi
+            echo "::warning::GitHub Release attempt ${attempt} failed; retrying in 15s..."
+            sleep 15
+          done
+
+      # Best-effort: ask the module proxy to fetch the new version so it appears on
+      # pkg.go.dev promptly. Never fails the release — the tag push already published
+      # the module; this only warms the index.
+      - name: Warm the module proxy (best-effort)
+        env:
+          REPO_PATH: ${{ github.repository }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          set -uo pipefail
+          GOPROXY=https://proxy.golang.org go list -m \
+            "github.com/${REPO_PATH}@${TAG}" || \
+            echo "::notice::Proxy warm-up did not complete; pkg.go.dev will pick up ${TAG} on first request."
