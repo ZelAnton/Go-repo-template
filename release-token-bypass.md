@@ -1,9 +1,10 @@
 # Letting the release workflow push to a protected `main`
 
-`.github/workflows/release.yml` pushes the release commit (the version bump +
-promoted `CHANGELOG.md`) and the `v<version>` tag straight to `main`. Once you
-protect `main` with a rule that **requires pull requests**, that direct push is
-rejected — for every actor except those on the rule's **bypass list**.
+`.github/workflows/release.yml` pushes the release commit (the promoted
+`CHANGELOG.md` — Go has no manifest version field to bump) and the `v<version>`
+tag straight to `main`. Once you protect `main` with a rule that **requires pull
+requests**, that direct push is rejected — for every actor except those on the
+rule's **bypass list**.
 
 You cannot put the built-in `github-actions[bot]` on a bypass list (it is a
 system actor, not an addressable App), and a personal access token expires and

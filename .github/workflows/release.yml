@@ -231,10 +231,8 @@ jobs:
 
           text = pathlib.Path("CHANGELOG.md").read_text()
           # Bound the body by the next version section, the reference-link block
-          # (`[Unreleased]: ...` / `[x.y.z]: ...`), or EOF. The link-block stop
-          # matters on a first release, where [Unreleased] is the last `##` section
-          # and the capture would otherwise swallow (and the auto-fill step would
-          # then delete) the trailing link definitions.
+          # (`[Unreleased]: ...` / `[x.y.z]: ...`), or EOF — the same bounds as the
+          # auto-fill step, so both read an identical [Unreleased] body.
           m = re.search(r"^## \[Unreleased\]\s*\n(.*?)(?=^## \[|^\[[^\]]+\]:|\Z)", text, re.M | re.S)
           body = (m.group(1) if m else "").strip()
 
@@ -387,10 +385,13 @@ jobs:
       # the module; this only warms the index.
       - name: Warm the module proxy (best-effort)
         env:
-          REPO_PATH: ${{ github.repository }}
           TAG: ${{ steps.version.outputs.tag }}
         run: |
           set -uo pipefail
+          # The proxy serves the module under its go.mod module path (authoritative
+          # even if the GitHub repo was named differently), so read it from go.mod
+          # rather than assuming github.com/<owner>/<repo>.
+          MODULE=$(go list -m)
           GOPROXY=https://proxy.golang.org go list -m \
-            "github.com/${REPO_PATH}@${TAG}" || \
+            "${MODULE}@${TAG}" || \
             echo "::notice::Proxy warm-up did not complete; pkg.go.dev will pick up ${TAG} on first request."

@@ -131,7 +131,10 @@ Write-Host "==> Initializing template as '$slug' (package '$goPackage')" -Foregr
 #    literal token strings as search keys, so substituting inside them would corrupt
 #    the sibling script.
 $siblingSh = Join-Path $PSScriptRoot 'init.sh'
-$files = Get-ChildItem -Path $repoRoot -File -Recurse | Where-Object {
+# -Force includes hidden-attributed files (Windows checkouts sometimes hidden-flag
+# dot-entries) so this pass sees exactly what init.sh's `find` sees; .git/.jj/vendor
+# stay excluded via Test-Excluded.
+$files = Get-ChildItem -Path $repoRoot -File -Recurse -Force | Where-Object {
     -not (Test-Excluded $_.FullName) -and $_.FullName -ne $selfPath -and $_.FullName -ne $siblingSh
 }
 $contentChanged = 0
@@ -153,7 +156,7 @@ Write-Host "    Updated contents in $contentChanged file(s)." -ForegroundColor D
 # 2) Rename files and folders whose name contains the project-name token.
 #    Deepest paths first so child renames don't invalidate parent paths. The flat
 #    Go layout has none, but a cmd/__ProjectName__ adaptation would, so support it.
-$named = Get-ChildItem -Path $repoRoot -Recurse | Where-Object {
+$named = Get-ChildItem -Path $repoRoot -Recurse -Force | Where-Object {
     -not (Test-Excluded $_.FullName) -and $_.Name -like '*__ProjectName__*'
 } | Sort-Object { $_.FullName.Length } -Descending
 foreach ($item in $named) {

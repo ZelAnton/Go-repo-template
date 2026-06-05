@@ -93,7 +93,7 @@ git add .gitignore && git commit -m "Keep agent instructions local"   # commit t
 ## Changelog
 
 - `CHANGELOG.md` is the single source of truth for release notes.
-- The release workflow reads `## [Unreleased]` automatically to populate the GitHub Release body (and, where applicable, the package's release-notes field).
+- The release workflow reads `## [Unreleased]` automatically to populate the GitHub Release body (a Go module has no other release-notes channel — pkg.go.dev links back to the repository).
 - **Every user-visible change must be accompanied by a `CHANGELOG.md` update in the same change set.** Non-negotiable for new/modified public API, behavioural changes, bug fixes, deprecations, removals. Pure internal refactors are the only exemption.
 - Add a manual bullet under `## [Unreleased]` in the appropriate subsection (`### Added` / `### Changed` / `### Fixed` / `### Removed` / `### Deprecated`). Write it for a consumer, not the implementer. Replace the placeholder `-`.
 - Do not modify versioned sections (`## [1.0.0]`, etc.) — those are managed by the release workflow.
