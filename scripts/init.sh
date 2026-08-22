@@ -244,6 +244,9 @@ fail_at content
 #    processes children before parents. The flat Go layout has none, but a
 #    cmd/__ProjectName__ adaptation would, so support it.
 while IFS= read -r -d '' item; do
+  case "$item" in
+    */.git/*|*/.jj/*|*/vendor/*) continue ;;
+  esac
   dir="$(dirname "$item")"
   base="$(basename "$item")"
   newbase="${base//__ProjectName__/$slug}"

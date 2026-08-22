@@ -118,7 +118,8 @@ $replacements = [ordered]@{
 
 # Binary files carry no tokens; reading/rewriting them as text would corrupt them.
 $binaryExtensions = @('.png', '.jpg', '.jpeg', '.gif', '.ico', '.zip')
-$excludedTopLevel = @('.git', '.jj', 'vendor', 'scripts')
+$excludedDirs = @('.git', '.jj', 'vendor')
+$excludedTopLevel = $excludedDirs + 'scripts'
 $stageRoot = $null
 $backupRoot = $null
 $swapComplete = $false
@@ -144,6 +145,14 @@ function Copy-TemplateTree([string]$sourceRoot, [string]$destinationRoot) {
         if ($excludedTopLevel -contains $item.Name) { continue }
         Copy-Item -LiteralPath $item.FullName -Destination $destinationRoot -Recurse -Force -ErrorAction Stop
     }
+}
+
+function Test-Excluded([string]$root, [string]$fullPath) {
+    $relativePath = $fullPath.Substring($root.Length).TrimStart('\', '/')
+    foreach ($segment in ($relativePath -split '[\\/]')) {
+        if ($excludedDirs -contains $segment) { return $true }
+    }
+    return $false
 }
 
 function Rollback-Swap {
@@ -194,7 +203,9 @@ try {
 
     # Binary files are never decoded. The initializer scripts stay in the live
     # scripts directory because the current PowerShell process may have the file open.
-    $files = Get-ChildItem -Path $stageRoot -File -Recurse -Force
+    $files = Get-ChildItem -Path $stageRoot -File -Recurse -Force | Where-Object {
+        -not (Test-Excluded $stageRoot $_.FullName)
+    }
     $contentChanged = 0
     foreach ($file in $files) {
         if ($binaryExtensions -contains $file.Extension) { continue }
@@ -214,7 +225,7 @@ try {
 
     # Rename deepest paths first so child renames do not invalidate parent paths.
     $named = Get-ChildItem -Path $stageRoot -Recurse -Force | Where-Object {
-        $_.Name -like '*__ProjectName__*'
+        -not (Test-Excluded $stageRoot $_.FullName) -and $_.Name -like '*__ProjectName__*'
     } | Sort-Object { $_.FullName.Length } -Descending
     foreach ($item in $named) {
         $newName = $item.Name.Replace('__ProjectName__', $slug)

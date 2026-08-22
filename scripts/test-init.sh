@@ -13,6 +13,18 @@ fail() {
   exit 1
 }
 
+create_excluded_fixture() {
+  local root="$1"
+  local excluded
+  for excluded in .git .jj vendor; do
+    mkdir -p -- "$root/nested/$excluded/__ProjectName__-directory"
+    printf '%s\n' '__ProjectName__' > "$root/nested/$excluded/__ProjectName__-directory/__ProjectName__.txt"
+  done
+}
+
+excluded_fixture_expected="$tmp_root/excluded-fixture-expected"
+create_excluded_fixture "$excluded_fixture_expected"
+
 copy_template() {
   local destination="$1"
   rm -rf -- "$destination"
@@ -21,6 +33,7 @@ copy_template() {
   rm -rf -- "$destination/.git"
   mkdir -p -- "$destination/__ProjectName__-fixtures"
   printf '%s\n' '__ProjectName__' > "$destination/__ProjectName__-fixtures/__ProjectName__.txt"
+  cp -a -- "$excluded_fixture_expected" "$destination/nested-excluded-fixture"
 }
 
 assert_same_tree() {
@@ -41,6 +54,10 @@ assert_generated() {
   test ! -e "$copy/docs/AGENT-INIT-GUIDE.md" || fail "agent guide remained"
   test -f "$copy/safe-widgets-fixtures/safe-widgets.txt" || fail "token-named fixture was not renamed"
   grep -Fq -- 'safe-widgets' "$copy/safe-widgets-fixtures/safe-widgets.txt" || fail "fixture content was not substituted"
+  if ! diff -r -q -- "$excluded_fixture_expected" "$copy/nested-excluded-fixture" >/dev/null; then
+    diff -r -q -- "$excluded_fixture_expected" "$copy/nested-excluded-fixture" >&2 || true
+    fail "nested .git/.jj/vendor fixture changed"
+  fi
   test ! -e "$copy/scripts/test-init.sh" || fail "test harness remained"
 }
 
