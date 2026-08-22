@@ -123,6 +123,9 @@ $stageRoot = $null
 $backupRoot = $null
 $swapComplete = $false
 $swapStarted = $false
+$rollbackComplete = $false
+$evacuatedNames = [System.Collections.Generic.List[string]]::new()
+$installedNames = [System.Collections.Generic.List[string]]::new()
 
 function Fail-At([string]$stage) {
     if ($failureStage -eq $stage) {
@@ -143,14 +146,36 @@ function Copy-TemplateTree([string]$sourceRoot, [string]$destinationRoot) {
     }
 }
 
-function Rollback-Swap([string[]]$originalNames, [string[]]$stagedNames) {
-    foreach ($name in $stagedNames) {
-        Remove-PathIfPresent (Join-Path $repoRoot $name)
+function Rollback-Swap {
+    foreach ($name in $installedNames) {
+        $installed = Join-Path $repoRoot $name
+        Remove-PathIfPresent $installed
+        if (Test-Path -LiteralPath $installed) {
+            throw "Rollback could not remove installed entry '$installed'."
+        }
     }
-    foreach ($name in $originalNames) {
+
+    $restored = 0
+    foreach ($name in $evacuatedNames) {
         $saved = Join-Path $backupRoot $name
-        if (Test-Path -LiteralPath $saved) {
-            Move-Item -LiteralPath $saved -Destination $repoRoot -Force -ErrorAction Stop
+        $target = Join-Path $repoRoot $name
+        if (-not (Test-Path -LiteralPath $saved)) {
+            throw "Rollback backup entry is missing: '$saved'."
+        }
+        if (Test-Path -LiteralPath $target) {
+            throw "Rollback restore target already exists: '$target'."
+        }
+        Move-Item -LiteralPath $saved -Destination $repoRoot -ErrorAction Stop
+        $restored++
+        if ($failureStage -eq 'restore' -and $restored -eq 1) {
+            throw "Injected initializer failure at stage 'restore'."
+        }
+    }
+
+    foreach ($name in $evacuatedNames) {
+        if ((Test-Path -LiteralPath (Join-Path $backupRoot $name)) -or
+            -not (Test-Path -LiteralPath (Join-Path $repoRoot $name))) {
+            throw "Rollback could not verify restored entry '$name'."
         }
     }
 }
@@ -231,13 +256,18 @@ try {
     $swapStarted = $true
     foreach ($name in $originalNames) {
         Move-Item -LiteralPath (Join-Path $repoRoot $name) -Destination $backupRoot -Force -ErrorAction Stop
+        $evacuatedNames.Add($name)
+        if ($failureStage -eq 'evacuate' -and $evacuatedNames.Count -eq 1) {
+            throw "Injected initializer failure at stage 'evacuate'."
+        }
     }
     $stagedMoves = 0
     foreach ($name in $stagedNames) {
         Move-Item -LiteralPath (Join-Path $stageRoot $name) -Destination $repoRoot -Force -ErrorAction Stop
+        $installedNames.Add($name)
         $stagedMoves++
-        if ($failureStage -eq 'commit' -and $stagedMoves -eq 1) {
-            throw "Injected initializer failure at stage 'commit'."
+        if (($failureStage -eq 'commit' -or $failureStage -eq 'restore') -and $stagedMoves -eq 1) {
+            throw "Injected initializer failure at stage '$failureStage'."
         }
     }
     $swapComplete = $true
@@ -263,17 +293,25 @@ try {
     }
 }
 catch {
+    $initialFailure = $_
     if (-not $swapComplete -and $swapStarted) {
         try {
-            Rollback-Swap $originalNames $stagedNames
+            Rollback-Swap
+            $rollbackComplete = $true
         }
         catch {
-            throw "Initializer failed and rollback also failed: $($_.Exception.Message)"
+            throw "Initializer failed: $($initialFailure.Exception.Message) Rollback also failed: $($_.Exception.Message) Original entries remain recoverable at '$backupRoot'."
         }
     }
-    throw
+    throw $initialFailure
 }
 finally {
     if ($stageRoot) { Remove-PathIfPresent $stageRoot }
-    if ($backupRoot) { Remove-PathIfPresent $backupRoot }
+    if ($backupRoot -and (Test-Path -LiteralPath $backupRoot)) {
+        if (-not $swapStarted -or $swapComplete -or $rollbackComplete) {
+            Remove-PathIfPresent $backupRoot
+        } else {
+            Write-Warning "Preserving incomplete rollback backup at '$backupRoot'."
+        }
+    }
 }

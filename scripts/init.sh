@@ -92,16 +92,19 @@ self="$script_dir/$(basename "$0")"
 sibling_ps1="$script_dir/init.ps1"
 test_harness="$script_dir/test-init.sh"
 
-# TEMPLATE_INIT_FAIL_AT is a disposable-test hook. It is checked only while the
-# staged tree is being prepared (before the live-tree swap), so an injected error
-# must leave the source tree byte-for-byte unchanged.
+# TEMPLATE_INIT_FAIL_AT is a disposable-test hook. Preparation failures and a
+# partial evacuation must roll back byte-for-byte; a deliberately interrupted
+# restore must preserve the remaining originals in the reported backup tree.
 failure_stage="${TEMPLATE_INIT_FAIL_AT:-}"
 stage_root=""
 backup_root=""
 swap_started=0
 swap_complete=0
+rollback_complete=0
 original_entries=()
 staged_entries=()
+evacuated_names=()
+installed_names=()
 
 fail_at() {
   if [ "$failure_stage" = "$1" ]; then
@@ -114,19 +117,40 @@ path_exists() {
 }
 
 rollback_swap() {
-  local entry name
-  for entry in "${staged_entries[@]}"; do
-    name="$(basename "$entry")"
+  local name saved restore_moves=0
+  for name in "${installed_names[@]}"; do
     if path_exists "$repo_root/$name"; then
-      rm -rf -- "$repo_root/$name"
+      rm -rf -- "$repo_root/$name" || return 1
+    fi
+    if path_exists "$repo_root/$name"; then
+      echo "error: rollback could not remove installed entry '$repo_root/$name'" >&2
+      return 1
     fi
   done
-  for entry in "${original_entries[@]}"; do
-    name="$(basename "$entry")"
-    if path_exists "$backup_root/$name"; then
-      mv -- "$backup_root/$name" "$repo_root/$name"
+  for name in "${evacuated_names[@]}"; do
+    saved="$backup_root/$name"
+    if ! path_exists "$saved"; then
+      echo "error: rollback backup entry is missing: '$saved'" >&2
+      return 1
+    fi
+    if path_exists "$repo_root/$name"; then
+      echo "error: rollback restore target already exists: '$repo_root/$name'" >&2
+      return 1
+    fi
+    mv -- "$saved" "$repo_root/$name" || return 1
+    restore_moves=$((restore_moves + 1))
+    if [ "$failure_stage" = restore ] && [ "$restore_moves" -eq 1 ]; then
+      echo "error: injected initializer failure at stage 'restore'" >&2
+      return 1
     fi
   done
+  for name in "${evacuated_names[@]}"; do
+    if path_exists "$backup_root/$name" || ! path_exists "$repo_root/$name"; then
+      echo "error: rollback could not verify restored entry '$name'" >&2
+      return 1
+    fi
+  done
+  rollback_complete=1
 }
 
 cleanup_transaction() {
@@ -134,7 +158,7 @@ cleanup_transaction() {
   trap - EXIT
   if [ "$swap_complete" -eq 0 ] && [ "$swap_started" -eq 1 ]; then
     if ! rollback_swap; then
-      echo "error: initializer failed and rollback also failed" >&2
+      echo "error: initializer failed and rollback also failed; original entries remain recoverable at '$backup_root'" >&2
       status=1
     fi
   fi
@@ -142,7 +166,12 @@ cleanup_transaction() {
     rm -rf -- "$stage_root" || status=1
   fi
   if [ -n "$backup_root" ] && path_exists "$backup_root"; then
-    rm -rf -- "$backup_root" || status=1
+    if [ "$swap_started" -eq 0 ] || [ "$swap_complete" -eq 1 ] || [ "$rollback_complete" -eq 1 ]; then
+      rm -rf -- "$backup_root" || status=1
+    else
+      echo "error: preserving incomplete rollback backup at '$backup_root'" >&2
+      status=1
+    fi
   fi
   exit "$status"
 }
@@ -258,13 +287,18 @@ backup_root="$(mktemp -d "$(dirname "$repo_root")/.$(basename "$repo_root").init
 swap_started=1
 for entry in "${original_entries[@]}"; do
   mv -- "$entry" "$backup_root/"
+  evacuated_names+=("$(basename "$entry")")
+  if [ "$failure_stage" = evacuate ] && [ "${#evacuated_names[@]}" -eq 1 ]; then
+    die "injected initializer failure at stage 'evacuate'"
+  fi
 done
 commit_moves=0
 for entry in "${staged_entries[@]}"; do
   mv -- "$entry" "$repo_root/"
+  installed_names+=("$(basename "$entry")")
   commit_moves=$((commit_moves + 1))
-  if [ "$failure_stage" = commit ] && [ "$commit_moves" -eq 1 ]; then
-    die "injected initializer failure at stage 'commit'"
+  if { [ "$failure_stage" = commit ] || [ "$failure_stage" = restore ]; } && [ "$commit_moves" -eq 1 ]; then
+    die "injected initializer failure at stage '$failure_stage'"
   fi
 done
 swap_complete=1
