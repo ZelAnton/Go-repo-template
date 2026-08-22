@@ -23,8 +23,10 @@ assert_unchanged_after_rejection() {
   local copy="$1"
   test -f "$copy/TEMPLATE.md" || fail "rejected initialization removed TEMPLATE.md"
   test -f "$copy/scripts/init.sh" || fail "rejected initialization removed init.sh"
+  test -f "$copy/scripts/test-init.sh" || fail "rejected initialization removed test-init.sh"
   assert_contains '__Author__' "$copy/LICENSE"
   assert_contains '__GitHubOwner__' "$copy/go.mod"
+  bash -n "$copy/scripts/test-init.sh"
 }
 
 copy_template() {
@@ -73,6 +75,16 @@ run_rejection_test() {
   assert_unchanged_after_rejection "$copy"
 
   copy_template "$copy"
+  # Keep the value above a typical pipe buffer while staying below the Windows
+  # process command-line limit used by the WSL test runner.
+  local long_author="Bad$(printf '\a')$(printf '%70000s' '' | tr ' ' x)"
+  if run_initializer "$initializer" "$copy" "$long_author" 'safe@example.com' 'acme'; then
+    fail "$initializer accepted a long author containing BEL"
+  fi >"$output" 2>&1
+  assert_contains 'control characters' "$output"
+  assert_unchanged_after_rejection "$copy"
+
+  copy_template "$copy"
   if run_initializer "$initializer" "$copy" 'Jane Doe' 'safe@example.com' 'bad owner'; then
     fail "$initializer accepted an invalid GitHub owner"
   fi >"$output" 2>&1
@@ -89,6 +101,7 @@ run_valid_test() {
   assert_contains 'Copyright (c) ' "$copy/LICENSE"
   assert_contains "git config user.name \"O'Connor\"" "$copy/.github/workflows/release.yml"
   assert_contains 'git config user.email "jane+release@example.com"' "$copy/.github/workflows/release.yml"
+  test ! -e "$copy/scripts/test-init.sh" || fail "generated repository retained disposable test-init.sh"
   if command -v go >/dev/null 2>&1; then
     (cd "$copy" && go mod edit -json >/dev/null)
   fi

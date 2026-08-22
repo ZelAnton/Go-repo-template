@@ -6,7 +6,8 @@
 # Replaces the placeholder tokens (__ProjectName__, __GoPackage__, __Author__,
 # __AuthorEmail__, __GitHubOwner__, __Description__, __Year__) in file contents AND
 # in file/folder names, then removes the template-only files (TEMPLATE.md,
-# docs/AGENT-INIT-GUIDE.md) and — unless --keep-script — both initializers.
+# docs/AGENT-INIT-GUIDE.md, scripts/test-init.sh) and — unless --keep-script —
+# both initializers.
 #
 # Usage:
 #   bash ./scripts/init.sh --project-name my-widgets \
@@ -94,7 +95,9 @@ validate_release_value() {
       die "invalid --$parameter_name. It must not be empty or contain control characters (including quotes, backslashes, or newlines)."
       ;;
   esac
-  if printf '%s' "$value" | LC_ALL=C grep -q '[[:cntrl:]]'; then
+  # Consume the complete stream: grep -q can close the pipe early, causing
+  # printf to receive SIGPIPE and making pipefail hide a matching control byte.
+  if printf '%s' "$value" | LC_ALL=C grep '[[:cntrl:]]' >/dev/null; then
     die "invalid --$parameter_name. It must not be empty or contain control characters (including quotes, backslashes, or newlines)."
   fi
   # These characters could terminate the workflow's POSIX shell/YAML string or
@@ -116,6 +119,7 @@ script_dir="$(cd "$(dirname "$0")" && pwd)"
 repo_root="$(cd "$script_dir/.." && pwd)"
 self="$script_dir/$(basename "$0")"
 sibling_ps1="$script_dir/init.ps1"
+test_harness="$script_dir/test-init.sh"
 
 echo "==> Initializing template as '$slug' (package '$go_package')"
 
@@ -146,13 +150,13 @@ substitute_tokens() {
     }'
 }
 
-# 1) Replace tokens in file contents. Both initializers are skipped: they carry the
-#    literal token strings as search keys, so substituting inside them would corrupt
-#    the sibling script.
+# 1) Replace tokens in file contents. Both initializers and the disposable test
+#    harness are skipped: they carry literal token strings as search keys, and the
+#    harness is removed as a template-only file below.
 changed=0
 while IFS= read -r -d '' file; do
   case "$file" in
-    "$self"|"$sibling_ps1") continue ;;
+    "$self"|"$sibling_ps1"|"$test_harness") continue ;;
   esac
   # Skip binary files (NUL bytes get stripped through command substitution).
   case "$file" in
@@ -194,7 +198,7 @@ if [ -f "$repo_root/.claude/settings.json.template" ]; then
 fi
 
 # 4) Remove template-only files.
-rm -f "$repo_root/TEMPLATE.md" "$repo_root/docs/AGENT-INIT-GUIDE.md"
+rm -f "$repo_root/TEMPLATE.md" "$repo_root/docs/AGENT-INIT-GUIDE.md" "$test_harness"
 rmdir "$repo_root/docs" 2>/dev/null || true
 
 echo ""
