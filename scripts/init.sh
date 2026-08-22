@@ -105,8 +105,8 @@ swap_complete=0
 rollback_complete=0
 original_entries=()
 staged_entries=()
-evacuated_names=()
-installed_names=()
+evacuated_paths=()
+installed_paths=()
 
 fail_at() {
   if [ "$failure_stage" = "$1" ]; then
@@ -119,8 +119,8 @@ path_exists() {
 }
 
 recover_unresolved_backup() {
-  local candidates=() backup entry name
-  local recovered_names=()
+  local candidates=() backup entry name relative target
+  local recovered_paths=()
 
   while IFS= read -r -d '' backup; do
     candidates+=("$backup")
@@ -133,17 +133,36 @@ recover_unresolved_backup() {
 
   backup="${candidates[0]}"
   echo "==> Recovering interrupted rollback from '$backup'"
+
+  # Ordinary scripts entries are backed up below a scripts container because the
+  # live scripts directory itself must remain in place while an initializer runs.
+  if [ -d "$backup/scripts" ]; then
+    mkdir -p -- "$repo_root/scripts"
+    while IFS= read -r -d '' entry; do
+      name="$(basename "$entry")"
+      relative="scripts/$name"
+      target="$repo_root/$relative"
+      if path_exists "$target"; then
+        die "cannot recover '$backup': restore target '$target' already exists"
+      fi
+      mv -- "$entry" "$target" || die "cannot recover '$backup': failed to restore '$relative'"
+      recovered_paths+=("$relative")
+    done < <(find "$backup/scripts" -mindepth 1 -maxdepth 1 -print0)
+    rmdir -- "$backup/scripts" || die "cannot recover '$backup': failed to remove the scripts backup container"
+  fi
+
   while IFS= read -r -d '' entry; do
     name="$(basename "$entry")"
-    if path_exists "$repo_root/$name"; then
-      die "cannot recover '$backup': restore target '$repo_root/$name' already exists"
+    target="$repo_root/$name"
+    if path_exists "$target"; then
+      die "cannot recover '$backup': restore target '$target' already exists"
     fi
-    mv -- "$entry" "$repo_root/$name" || die "cannot recover '$backup': failed to restore '$name'"
-    recovered_names+=("$name")
+    mv -- "$entry" "$target" || die "cannot recover '$backup': failed to restore '$name'"
+    recovered_paths+=("$name")
   done < <(find "$backup" -mindepth 1 -maxdepth 1 -print0)
 
-  for name in "${recovered_names[@]}"; do
-    path_exists "$repo_root/$name" || die "cannot verify restored entry '$repo_root/$name'; backup remains at '$backup'"
+  for relative in "${recovered_paths[@]}"; do
+    path_exists "$repo_root/$relative" || die "cannot verify restored entry '$repo_root/$relative'; backup remains at '$backup'"
   done
   if find "$backup" -mindepth 1 -maxdepth 1 -print -quit | grep -q .; then
     die "cannot verify that recovery backup '$backup' is empty"
@@ -152,40 +171,86 @@ recover_unresolved_backup() {
 }
 
 rollback_swap() {
-  local name saved restore_moves=0
-  for name in "${installed_names[@]}"; do
-    if path_exists "$repo_root/$name"; then
-      rm -rf -- "$repo_root/$name" || return 1
+  local relative saved target restore_moves=0
+  for relative in "${installed_paths[@]}"; do
+    target="$repo_root/$relative"
+    if path_exists "$target"; then
+      rm -rf -- "$target" || return 1
     fi
-    if path_exists "$repo_root/$name"; then
-      echo "error: rollback could not remove installed entry '$repo_root/$name'" >&2
+    if path_exists "$target"; then
+      echo "error: rollback could not remove installed entry '$target'" >&2
       return 1
     fi
   done
-  for name in "${evacuated_names[@]}"; do
-    saved="$backup_root/$name"
+  for relative in "${evacuated_paths[@]}"; do
+    saved="$backup_root/$relative"
+    target="$repo_root/$relative"
     if ! path_exists "$saved"; then
       echo "error: rollback backup entry is missing: '$saved'" >&2
       return 1
     fi
-    if path_exists "$repo_root/$name"; then
-      echo "error: rollback restore target already exists: '$repo_root/$name'" >&2
+    if path_exists "$target"; then
+      echo "error: rollback restore target already exists: '$target'" >&2
       return 1
     fi
-    mv -- "$saved" "$repo_root/$name" || return 1
+    mkdir -p -- "$(dirname "$target")" || return 1
+    mv -- "$saved" "$target" || return 1
     restore_moves=$((restore_moves + 1))
     if [ "$failure_stage" = restore ] && [ "$restore_moves" -eq 1 ]; then
       echo "error: injected initializer failure at stage 'restore'" >&2
       return 1
     fi
   done
-  for name in "${evacuated_names[@]}"; do
-    if path_exists "$backup_root/$name" || ! path_exists "$repo_root/$name"; then
-      echo "error: rollback could not verify restored entry '$name'" >&2
+  for relative in "${evacuated_paths[@]}"; do
+    if path_exists "$backup_root/$relative" || ! path_exists "$repo_root/$relative"; then
+      echo "error: rollback could not verify restored entry '$relative'" >&2
       return 1
     fi
   done
   rollback_complete=1
+}
+
+apply_scripts_stage() {
+  local live_scripts="$repo_root/scripts"
+  local staged_scripts="$stage_root/scripts"
+  local entry name relative target
+  local script_evacuations=0 script_installs=0
+
+  mkdir -p -- "$live_scripts" "$backup_root/scripts"
+
+  # Keep the live directory and runtime scripts in place. Only ordinary direct
+  # children move; a token-named directory carries its transformed descendants.
+  while IFS= read -r -d '' entry; do
+    name="$(basename "$entry")"
+    case "$name" in
+      init.sh|init.ps1|test-init.sh) continue ;;
+    esac
+    relative="scripts/$name"
+    mv -- "$entry" "$backup_root/$relative"
+    evacuated_paths+=("$relative")
+    script_evacuations=$((script_evacuations + 1))
+    if [ "$failure_stage" = remove-scripts ] && [ "$script_evacuations" -eq 1 ]; then
+      die "injected initializer failure at stage 'remove-scripts'"
+    fi
+  done < <(find "$live_scripts" -mindepth 1 -maxdepth 1 -print0)
+
+  while IFS= read -r -d '' entry; do
+    name="$(basename "$entry")"
+    case "$name" in
+      init.sh|init.ps1|test-init.sh) continue ;;
+    esac
+    relative="scripts/$name"
+    target="$repo_root/$relative"
+    if path_exists "$target"; then
+      die "cannot install staged script entry '$relative': target '$target' already exists"
+    fi
+    mv -- "$entry" "$target"
+    installed_paths+=("$relative")
+    script_installs=$((script_installs + 1))
+    if [ "$failure_stage" = scripts ] && [ "$script_installs" -eq 1 ]; then
+      die "injected initializer failure at stage 'scripts'"
+    fi
+  done < <(find "$staged_scripts" -mindepth 1 -maxdepth 1 -print0)
 }
 
 cleanup_transaction() {
@@ -311,43 +376,43 @@ fail_at activate
 rm -f "$stage_root/TEMPLATE.md" "$stage_root/docs/AGENT-INIT-GUIDE.md"
 rmdir "$stage_root/docs" 2>/dev/null || true
 fail_at delete
-fail_at remove-scripts
 
-# Commit the prepared tree by moving the mutable top-level entries to an adjacent
-# backup, then moving the staged entries into place. Any error before completion
-# restores the original entries from that backup.
+# Commit the prepared top-level tree by moving mutable entries to an adjacent
+# backup, then moving staged entries into place. scripts/ is applied separately so
+# its live directory and runtime files never move while an initializer runs.
 while IFS= read -r -d '' entry; do
   name="$(basename "$entry")"
   case "$name" in
-    .git|.jj|vendor) continue ;;
+    .git|.jj|vendor|scripts) continue ;;
   esac
-  if [ "$name" = scripts ]; then
-    original_entries=("$entry" "${original_entries[@]}")
-  else
-    original_entries+=("$entry")
-  fi
+  original_entries+=("$name")
 done < <(find "$repo_root" -mindepth 1 -maxdepth 1 -print0)
 while IFS= read -r -d '' entry; do
-  staged_entries+=("$entry")
+  name="$(basename "$entry")"
+  [ "$name" = scripts ] && continue
+  staged_entries+=("$name")
 done < <(find "$stage_root" -mindepth 1 -maxdepth 1 -print0)
 backup_root="$(mktemp -d "$parent_root/.$(basename "$repo_root").init-backup.XXXXXXXX")"
 swap_started=1
-for entry in "${original_entries[@]}"; do
-  mv -- "$entry" "$backup_root/"
-  evacuated_names+=("$(basename "$entry")")
-  if [ "$failure_stage" = evacuate ] && [ "${#evacuated_names[@]}" -eq 1 ]; then
+for relative in "${original_entries[@]}"; do
+  mkdir -p -- "$(dirname "$backup_root/$relative")"
+  mv -- "$repo_root/$relative" "$backup_root/$relative"
+  evacuated_paths+=("$relative")
+  if [ "$failure_stage" = evacuate ] && [ "${#evacuated_paths[@]}" -eq 1 ]; then
     die "injected initializer failure at stage 'evacuate'"
   fi
 done
 commit_moves=0
-for entry in "${staged_entries[@]}"; do
-  mv -- "$entry" "$repo_root/"
-  installed_names+=("$(basename "$entry")")
+for relative in "${staged_entries[@]}"; do
+  mkdir -p -- "$(dirname "$repo_root/$relative")"
+  mv -- "$stage_root/$relative" "$repo_root/$relative"
+  installed_paths+=("$relative")
   commit_moves=$((commit_moves + 1))
   if { [ "$failure_stage" = commit ] || [ "$failure_stage" = restore ]; } && [ "$commit_moves" -eq 1 ]; then
     die "injected initializer failure at stage '$failure_stage'"
   fi
 done
+apply_scripts_stage
 swap_complete=1
 
 echo ""

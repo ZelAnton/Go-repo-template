@@ -128,8 +128,8 @@ $backupRoot = $null
 $swapComplete = $false
 $swapStarted = $false
 $rollbackComplete = $false
-$evacuatedNames = [System.Collections.Generic.List[string]]::new()
-$installedNames = [System.Collections.Generic.List[string]]::new()
+$evacuatedPaths = [System.Collections.Generic.List[string]]::new()
+$installedPaths = [System.Collections.Generic.List[string]]::new()
 
 function Fail-At([string]$stage) {
     if ($failureStage -eq $stage) {
@@ -175,7 +175,31 @@ function Restore-UnresolvedBackup {
 
     $candidate = $candidates[0].FullName
     Write-Host "==> Recovering interrupted rollback from '$candidate'" -ForegroundColor Yellow
-    $recoveredNames = [System.Collections.Generic.List[string]]::new()
+    $recoveredPaths = [System.Collections.Generic.List[string]]::new()
+
+    # Ordinary scripts entries are backed up below a scripts container because the
+    # live scripts directory itself must remain in place while an initializer runs.
+    $savedScripts = Join-Path $candidate 'scripts'
+    if (Test-Path -LiteralPath $savedScripts -PathType Container) {
+        $liveScripts = Join-Path $repoRoot 'scripts'
+        New-Item -ItemType Directory -Path $liveScripts -Force | Out-Null
+        foreach ($entry in @(Get-ChildItem -LiteralPath $savedScripts -Force)) {
+            $relativePath = 'scripts/' + $entry.Name
+            $target = Join-Path $repoRoot $relativePath
+            if (Test-Path -LiteralPath $target) {
+                throw "Cannot recover '$candidate': restore target '$target' already exists."
+            }
+            try {
+                Move-Item -LiteralPath $entry.FullName -Destination $target -ErrorAction Stop
+            }
+            catch {
+                throw "Cannot recover '$candidate': failed to restore '$relativePath': $($_.Exception.Message)"
+            }
+            $recoveredPaths.Add($relativePath)
+        }
+        Remove-Item -LiteralPath $savedScripts -Force -ErrorAction Stop
+    }
+
     foreach ($entry in @(Get-ChildItem -LiteralPath $candidate -Force)) {
         $target = Join-Path $repoRoot $entry.Name
         if (Test-Path -LiteralPath $target) {
@@ -187,12 +211,12 @@ function Restore-UnresolvedBackup {
         catch {
             throw "Cannot recover '$candidate': failed to restore '$($entry.Name)': $($_.Exception.Message)"
         }
-        $recoveredNames.Add($entry.Name)
+        $recoveredPaths.Add($entry.Name)
     }
 
-    foreach ($name in $recoveredNames) {
-        if (-not (Test-Path -LiteralPath (Join-Path $repoRoot $name))) {
-            throw "Cannot verify restored entry '$name'; backup remains at '$candidate'."
+    foreach ($relativePath in $recoveredPaths) {
+        if (-not (Test-Path -LiteralPath (Join-Path $repoRoot $relativePath))) {
+            throw "Cannot verify restored entry '$relativePath'; backup remains at '$candidate'."
         }
     }
     if (Get-ChildItem -LiteralPath $candidate -Force) {
@@ -202,8 +226,8 @@ function Restore-UnresolvedBackup {
 }
 
 function Rollback-Swap {
-    foreach ($name in $installedNames) {
-        $installed = Join-Path $repoRoot $name
+    foreach ($relativePath in $installedPaths) {
+        $installed = Join-Path $repoRoot $relativePath
         Remove-PathIfPresent $installed
         if (Test-Path -LiteralPath $installed) {
             throw "Rollback could not remove installed entry '$installed'."
@@ -211,26 +235,69 @@ function Rollback-Swap {
     }
 
     $restored = 0
-    foreach ($name in $evacuatedNames) {
-        $saved = Join-Path $backupRoot $name
-        $target = Join-Path $repoRoot $name
+    foreach ($relativePath in $evacuatedPaths) {
+        $saved = Join-Path $backupRoot $relativePath
+        $target = Join-Path $repoRoot $relativePath
         if (-not (Test-Path -LiteralPath $saved)) {
             throw "Rollback backup entry is missing: '$saved'."
         }
         if (Test-Path -LiteralPath $target) {
             throw "Rollback restore target already exists: '$target'."
         }
-        Move-Item -LiteralPath $saved -Destination $repoRoot -ErrorAction Stop
+        $targetParent = Split-Path -Parent $target
+        New-Item -ItemType Directory -Path $targetParent -Force | Out-Null
+        Move-Item -LiteralPath $saved -Destination $target -ErrorAction Stop
         $restored++
         if ($failureStage -eq 'restore' -and $restored -eq 1) {
             throw "Injected initializer failure at stage 'restore'."
         }
     }
 
-    foreach ($name in $evacuatedNames) {
-        if ((Test-Path -LiteralPath (Join-Path $backupRoot $name)) -or
-            -not (Test-Path -LiteralPath (Join-Path $repoRoot $name))) {
-            throw "Rollback could not verify restored entry '$name'."
+    foreach ($relativePath in $evacuatedPaths) {
+        if ((Test-Path -LiteralPath (Join-Path $backupRoot $relativePath)) -or
+            -not (Test-Path -LiteralPath (Join-Path $repoRoot $relativePath))) {
+            throw "Rollback could not verify restored entry '$relativePath'."
+        }
+    }
+}
+
+function Apply-ScriptsStage {
+    $liveScripts = Join-Path $repoRoot 'scripts'
+    $stagedScripts = Join-Path $stageRoot 'scripts'
+    $savedScripts = Join-Path $backupRoot 'scripts'
+    $runtimeNames = @('init.ps1', 'init.sh', 'test-init.sh')
+    $scriptEvacuations = 0
+    $scriptInstalls = 0
+
+    New-Item -ItemType Directory -Path $liveScripts -Force | Out-Null
+    New-Item -ItemType Directory -Path $savedScripts -Force | Out-Null
+
+    # Keep the live directory and runtime scripts in place. Only ordinary direct
+    # children move; a token-named directory carries its transformed descendants.
+    foreach ($entry in @(Get-ChildItem -LiteralPath $liveScripts -Force)) {
+        if ($runtimeNames -contains $entry.Name) { continue }
+        $relativePath = 'scripts/' + $entry.Name
+        $savedPath = Join-Path $backupRoot $relativePath
+        Move-Item -LiteralPath $entry.FullName -Destination $savedPath -ErrorAction Stop
+        $evacuatedPaths.Add($relativePath)
+        $scriptEvacuations++
+        if ($failureStage -eq 'remove-scripts' -and $scriptEvacuations -eq 1) {
+            throw "Injected initializer failure at stage 'remove-scripts'."
+        }
+    }
+
+    foreach ($entry in @(Get-ChildItem -LiteralPath $stagedScripts -Force)) {
+        if ($runtimeNames -contains $entry.Name) { continue }
+        $relativePath = 'scripts/' + $entry.Name
+        $targetPath = Join-Path $repoRoot $relativePath
+        if (Test-Path -LiteralPath $targetPath) {
+            throw "Cannot install staged script entry '$relativePath': target '$targetPath' already exists."
+        }
+        Move-Item -LiteralPath $entry.FullName -Destination $targetPath -ErrorAction Stop
+        $installedPaths.Add($relativePath)
+        $scriptInstalls++
+        if ($failureStage -eq 'scripts' -and $scriptInstalls -eq 1) {
+            throw "Injected initializer failure at stage 'scripts'."
         }
     }
 }
@@ -302,38 +369,42 @@ try {
         Remove-Item -LiteralPath $stagedDocs -Force -ErrorAction Stop
     }
     Fail-At 'delete'
-    Fail-At 'remove-scripts'
 
-    $originalNames = @(
+    # Swap only mutable top-level entries. scripts/ is applied separately so its
+    # live directory and runtime files never move while an initializer runs.
+    $originalPaths = @(
         Get-ChildItem -LiteralPath $repoRoot -Force |
-            Where-Object { $excludedTopLevel -notcontains $_.Name } |
+            Where-Object { $excludedTopLevel -notcontains $_.Name -and $_.Name -ne 'scripts' } |
             Select-Object -ExpandProperty Name
     )
-    if ($originalNames -contains 'scripts') {
-        $originalNames = @('scripts') + @($originalNames | Where-Object { $_ -ne 'scripts' })
-    }
-    $stagedNames = @(
+    $stagedPaths = @(
         Get-ChildItem -LiteralPath $stageRoot -Force |
+            Where-Object { $_.Name -ne 'scripts' } |
             Select-Object -ExpandProperty Name
     )
     New-Item -ItemType Directory -Path $backupRoot -Force | Out-Null
     $swapStarted = $true
-    foreach ($name in $originalNames) {
-        Move-Item -LiteralPath (Join-Path $repoRoot $name) -Destination $backupRoot -Force -ErrorAction Stop
-        $evacuatedNames.Add($name)
-        if ($failureStage -eq 'evacuate' -and $evacuatedNames.Count -eq 1) {
+    foreach ($relativePath in $originalPaths) {
+        $backupPath = Join-Path $backupRoot $relativePath
+        New-Item -ItemType Directory -Path (Split-Path -Parent $backupPath) -Force | Out-Null
+        Move-Item -LiteralPath (Join-Path $repoRoot $relativePath) -Destination $backupPath -Force -ErrorAction Stop
+        $evacuatedPaths.Add($relativePath)
+        if ($failureStage -eq 'evacuate' -and $evacuatedPaths.Count -eq 1) {
             throw "Injected initializer failure at stage 'evacuate'."
         }
     }
     $stagedMoves = 0
-    foreach ($name in $stagedNames) {
-        Move-Item -LiteralPath (Join-Path $stageRoot $name) -Destination $repoRoot -Force -ErrorAction Stop
-        $installedNames.Add($name)
+    foreach ($relativePath in $stagedPaths) {
+        $targetPath = Join-Path $repoRoot $relativePath
+        New-Item -ItemType Directory -Path (Split-Path -Parent $targetPath) -Force | Out-Null
+        Move-Item -LiteralPath (Join-Path $stageRoot $relativePath) -Destination $targetPath -Force -ErrorAction Stop
+        $installedPaths.Add($relativePath)
         $stagedMoves++
         if (($failureStage -eq 'commit' -or $failureStage -eq 'restore') -and $stagedMoves -eq 1) {
             throw "Injected initializer failure at stage '$failureStage'."
         }
     }
+    Apply-ScriptsStage
     $swapComplete = $true
 
     Write-Host ""

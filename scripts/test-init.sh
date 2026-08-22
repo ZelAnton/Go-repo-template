@@ -130,6 +130,7 @@ run_failure_stage() {
   assert_no_transaction_dirs "$copy"
   test -f "$copy/scripts/init.sh" || fail "$initializer failure removed init.sh at $stage"
   test -f "$copy/scripts/init.ps1" || fail "$initializer failure removed init.ps1 at $stage"
+  assert_runtime_scripts_unchanged "$copy"
 
   # A failed preparation can be retried without restoring the disposable copy.
   run_initializer "$initializer" "$copy" 1 >"$tmp_root/$initializer-$stage-retry.log" 2>&1
@@ -199,7 +200,7 @@ run_default_cleanup() {
   echo "PASS $initializer default cleanup"
 }
 
-stages='copy content rename activate delete remove-scripts evacuate commit'
+stages='copy content rename activate delete evacuate commit remove-scripts scripts'
 tested_initializers=0
 for initializer in sh ps1; do
   if [ "$initializer" = ps1 ] && ! command -v pwsh >/dev/null 2>&1; then
@@ -215,4 +216,4 @@ for initializer in sh ps1; do
 done
 
 [ "$tested_initializers" -gt 0 ] || fail 'no initializer was available'
-echo "initializer failure-path tests passed: $tested_initializers initializers, 10 checks each (9 injected failure stages, 1 default cleanup)"
+echo "initializer failure-path tests passed: $tested_initializers initializers, 11 checks each (10 injected failure stages, 1 default cleanup)"

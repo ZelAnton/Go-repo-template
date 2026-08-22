@@ -18,6 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rollback protection, and automatic recovery of a single interrupted-rollback
   backup before retry; ambiguous or conflicting recovery fails closed.
 - Restored token substitution and token-named path handling for ordinary files under
-  `scripts/` while keeping the initializer files unchanged until final cleanup.
+  `scripts/` while keeping the live directory and initializer files in place and
+  unchanged until final cleanup, including when initialization runs from Git Bash.
 
 [Unreleased]: https://github.com/__GitHubOwner__/__ProjectName__/commits/main
