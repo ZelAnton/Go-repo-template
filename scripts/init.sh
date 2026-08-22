@@ -6,8 +6,9 @@
 # Replaces the placeholder tokens (__ProjectName__, __GoPackage__, __Author__,
 # __AuthorEmail__, __GitHubOwner__, __Description__, __Year__) in file contents AND
 # in file/folder names, then removes the template-only files (TEMPLATE.md,
-# docs/AGENT-INIT-GUIDE.md, scripts/test-init.sh) and — unless --keep-script —
-# both initializers.
+# docs/AGENT-INIT-GUIDE.md and the disposable initializer test harness) and —
+# unless --keep-script — both initializers.
+# Changes are prepared in a staging tree and committed with rollback protection.
 #
 # Usage:
 #   bash ./scripts/init.sh --project-name my-widgets \
@@ -121,6 +122,193 @@ repo_root="$(cd "$script_dir/.." && pwd)"
 self="$script_dir/$(basename "$0")"
 sibling_ps1="$script_dir/init.ps1"
 test_harness="$script_dir/test-init.sh"
+parent_root="$(dirname "$repo_root")"
+transaction_prefix=".$(basename "$repo_root").init-backup"
+
+# TEMPLATE_INIT_FAIL_AT is a disposable-test hook. Preparation failures and a
+# partial evacuation must roll back byte-for-byte; a deliberately interrupted
+# restore must preserve the remaining originals in the reported backup tree.
+failure_stage="${TEMPLATE_INIT_FAIL_AT:-}"
+stage_root=""
+backup_root=""
+swap_started=0
+swap_complete=0
+rollback_complete=0
+original_entries=()
+staged_entries=()
+evacuated_paths=()
+installed_paths=()
+
+fail_at() {
+  if [ "$failure_stage" = "$1" ]; then
+    die "injected initializer failure at stage '$1'"
+  fi
+}
+
+path_exists() {
+  [ -e "$1" ] || [ -L "$1" ]
+}
+
+recover_unresolved_backup() {
+  local candidates=() backup entry name relative target
+  local recovered_paths=()
+
+  while IFS= read -r -d '' backup; do
+    candidates+=("$backup")
+  done < <(find "$parent_root" -mindepth 1 -maxdepth 1 -type d -name "$transaction_prefix*" -print0)
+
+  if [ "${#candidates[@]}" -gt 1 ]; then
+    die "found ${#candidates[@]} unresolved initializer backups beside '$repo_root'; refusing to choose one automatically"
+  fi
+  [ "${#candidates[@]}" -eq 1 ] || return 0
+
+  backup="${candidates[0]}"
+  echo "==> Recovering interrupted rollback from '$backup'"
+
+  # Ordinary scripts entries are backed up below a scripts container because the
+  # live scripts directory itself must remain in place while an initializer runs.
+  if [ -d "$backup/scripts" ]; then
+    mkdir -p -- "$repo_root/scripts"
+    while IFS= read -r -d '' entry; do
+      name="$(basename "$entry")"
+      relative="scripts/$name"
+      target="$repo_root/$relative"
+      if path_exists "$target"; then
+        die "cannot recover '$backup': restore target '$target' already exists"
+      fi
+      mv -- "$entry" "$target" || die "cannot recover '$backup': failed to restore '$relative'"
+      recovered_paths+=("$relative")
+    done < <(find "$backup/scripts" -mindepth 1 -maxdepth 1 -print0)
+    rmdir -- "$backup/scripts" || die "cannot recover '$backup': failed to remove the scripts backup container"
+  fi
+
+  while IFS= read -r -d '' entry; do
+    name="$(basename "$entry")"
+    target="$repo_root/$name"
+    if path_exists "$target"; then
+      die "cannot recover '$backup': restore target '$target' already exists"
+    fi
+    mv -- "$entry" "$target" || die "cannot recover '$backup': failed to restore '$name'"
+    recovered_paths+=("$name")
+  done < <(find "$backup" -mindepth 1 -maxdepth 1 -print0)
+
+  for relative in "${recovered_paths[@]}"; do
+    path_exists "$repo_root/$relative" || die "cannot verify restored entry '$repo_root/$relative'; backup remains at '$backup'"
+  done
+  if find "$backup" -mindepth 1 -maxdepth 1 -print -quit | grep -q .; then
+    die "cannot verify that recovery backup '$backup' is empty"
+  fi
+  rmdir -- "$backup" || die "cannot remove verified recovery backup '$backup'"
+}
+
+rollback_swap() {
+  local relative saved target restore_moves=0
+  for relative in "${installed_paths[@]}"; do
+    target="$repo_root/$relative"
+    if path_exists "$target"; then
+      rm -rf -- "$target" || return 1
+    fi
+    if path_exists "$target"; then
+      echo "error: rollback could not remove installed entry '$target'" >&2
+      return 1
+    fi
+  done
+  for relative in "${evacuated_paths[@]}"; do
+    saved="$backup_root/$relative"
+    target="$repo_root/$relative"
+    if ! path_exists "$saved"; then
+      echo "error: rollback backup entry is missing: '$saved'" >&2
+      return 1
+    fi
+    if path_exists "$target"; then
+      echo "error: rollback restore target already exists: '$target'" >&2
+      return 1
+    fi
+    mkdir -p -- "$(dirname "$target")" || return 1
+    mv -- "$saved" "$target" || return 1
+    restore_moves=$((restore_moves + 1))
+    if [ "$failure_stage" = restore ] && [ "$restore_moves" -eq 1 ]; then
+      echo "error: injected initializer failure at stage 'restore'" >&2
+      return 1
+    fi
+  done
+  for relative in "${evacuated_paths[@]}"; do
+    if path_exists "$backup_root/$relative" || ! path_exists "$repo_root/$relative"; then
+      echo "error: rollback could not verify restored entry '$relative'" >&2
+      return 1
+    fi
+  done
+  rollback_complete=1
+}
+
+apply_scripts_stage() {
+  local live_scripts="$repo_root/scripts"
+  local staged_scripts="$stage_root/scripts"
+  local entry name relative target
+  local script_evacuations=0 script_installs=0
+
+  mkdir -p -- "$live_scripts" "$backup_root/scripts"
+
+  # Keep the live directory and runtime scripts in place. Only ordinary direct
+  # children move; a token-named directory carries its transformed descendants.
+  while IFS= read -r -d '' entry; do
+    name="$(basename "$entry")"
+    case "$name" in
+      init.sh|init.ps1|test-init.sh) continue ;;
+    esac
+    relative="scripts/$name"
+    mv -- "$entry" "$backup_root/$relative"
+    evacuated_paths+=("$relative")
+    script_evacuations=$((script_evacuations + 1))
+    if [ "$failure_stage" = remove-scripts ] && [ "$script_evacuations" -eq 1 ]; then
+      die "injected initializer failure at stage 'remove-scripts'"
+    fi
+  done < <(find "$live_scripts" -mindepth 1 -maxdepth 1 -print0)
+
+  while IFS= read -r -d '' entry; do
+    name="$(basename "$entry")"
+    case "$name" in
+      init.sh|init.ps1|test-init.sh) continue ;;
+    esac
+    relative="scripts/$name"
+    target="$repo_root/$relative"
+    if path_exists "$target"; then
+      die "cannot install staged script entry '$relative': target '$target' already exists"
+    fi
+    mv -- "$entry" "$target"
+    installed_paths+=("$relative")
+    script_installs=$((script_installs + 1))
+    if [ "$failure_stage" = scripts ] && [ "$script_installs" -eq 1 ]; then
+      die "injected initializer failure at stage 'scripts'"
+    fi
+  done < <(find "$staged_scripts" -mindepth 1 -maxdepth 1 -print0)
+}
+
+cleanup_transaction() {
+  local status=$?
+  trap - EXIT
+  if [ "$swap_complete" -eq 0 ] && [ "$swap_started" -eq 1 ]; then
+    if ! rollback_swap; then
+      echo "error: initializer failed and rollback also failed; original entries remain recoverable at '$backup_root'" >&2
+      status=1
+    fi
+  fi
+  if [ -n "$stage_root" ] && path_exists "$stage_root"; then
+    rm -rf -- "$stage_root" || status=1
+  fi
+  if [ -n "$backup_root" ] && path_exists "$backup_root"; then
+    if [ "$swap_started" -eq 0 ] || [ "$swap_complete" -eq 1 ] || [ "$rollback_complete" -eq 1 ]; then
+      rm -rf -- "$backup_root" || status=1
+    else
+      echo "error: preserving incomplete rollback backup at '$backup_root'" >&2
+      status=1
+    fi
+  fi
+  exit "$status"
+}
+trap cleanup_transaction EXIT
+
+recover_unresolved_backup
 
 echo "==> Initializing template as '$slug' (package '$go_package')"
 
@@ -151,13 +339,24 @@ substitute_tokens() {
     }'
 }
 
-# 1) Replace tokens in file contents. Both initializers and the disposable test
-#    harness are skipped: they carry literal token strings as search keys, and the
-#    harness is removed as a template-only file below.
+# Prepare all mutable files in an adjacent staged tree. The initializer files and
+# disposable harness are copied byte-for-byte and left untouched until cleanup.
+stage_root="$(mktemp -d "$parent_root/.$(basename "$repo_root").init-stage.XXXXXXXX")"
+while IFS= read -r -d '' entry; do
+  name="$(basename "$entry")"
+  case "$name" in
+    .git|.jj|vendor) continue ;;
+  esac
+  cp -a -- "$entry" "$stage_root/"
+done < <(find "$repo_root" -mindepth 1 -maxdepth 1 -print0)
+fail_at copy
+
+# 1) Replace tokens in file contents. The initializer scripts and test harness
+#    remain byte-for-byte copies, so their literal search keys cannot be corrupted.
 changed=0
 while IFS= read -r -d '' file; do
   case "$file" in
-    "$self"|"$sibling_ps1"|"$test_harness") continue ;;
+    "$stage_root/scripts/init.sh"|"$stage_root/scripts/init.ps1"|"$stage_root/scripts/test-init.sh") continue ;;
   esac
   # Skip binary files (NUL bytes get stripped through command substitution).
   case "$file" in
@@ -173,8 +372,9 @@ while IFS= read -r -d '' file; do
     printf '%s' "$new" > "$file"
     changed=$((changed + 1))
   fi
-done < <(find "$repo_root" -type d \( -name .git -o -name .jj -o -name vendor \) -prune -o -type f -print0)
+done < <(find "$stage_root" -type d \( -name .git -o -name .jj -o -name vendor \) -prune -o -type f -print0)
 echo "    Updated contents in $changed file(s)."
+fail_at content
 
 # 2) Rename files and folders whose name contains the project-name token. -depth
 #    processes children before parents. The flat Go layout has none, but a
@@ -182,25 +382,70 @@ echo "    Updated contents in $changed file(s)."
 while IFS= read -r -d '' item; do
   case "$item" in
     */.git/*|*/.jj/*|*/vendor/*) continue ;;
+    "$stage_root/scripts/init.sh"|"$stage_root/scripts/init.ps1"|"$stage_root/scripts/test-init.sh") continue ;;
   esac
   dir="$(dirname "$item")"
   base="$(basename "$item")"
   newbase="${base//__ProjectName__/$slug}"
   if [ "$newbase" != "$base" ]; then
+    if path_exists "$dir/$newbase"; then
+      die "cannot rename '$item': target '$dir/$newbase' already exists"
+    fi
     mv "$item" "$dir/$newbase"
     echo "    Renamed $base -> $newbase"
   fi
-done < <(find "$repo_root" -depth -name '*__ProjectName__*' -print0)
+done < <(find "$stage_root" -depth -name '*__ProjectName__*' -print0)
+fail_at rename
 
-# 3) Activate the Claude Code shared settings.
-if [ -f "$repo_root/.claude/settings.json.template" ]; then
-  mv -f "$repo_root/.claude/settings.json.template" "$repo_root/.claude/settings.json"
+# 3) Activate the Claude Code shared settings in the staged tree.
+if [ -f "$stage_root/.claude/settings.json.template" ]; then
+  mv -f "$stage_root/.claude/settings.json.template" "$stage_root/.claude/settings.json"
   echo "    Activated .claude/settings.json"
 fi
+fail_at activate
 
-# 4) Remove template-only files.
-rm -f "$repo_root/TEMPLATE.md" "$repo_root/docs/AGENT-INIT-GUIDE.md" "$test_harness"
-rmdir "$repo_root/docs" 2>/dev/null || true
+# 4) Remove template-only files from the staged tree.
+rm -f "$stage_root/TEMPLATE.md" "$stage_root/docs/AGENT-INIT-GUIDE.md"
+rmdir "$stage_root/docs" 2>/dev/null || true
+fail_at delete
+
+# Commit the prepared top-level tree by moving mutable entries to an adjacent
+# backup, then moving staged entries into place. scripts/ is applied separately so
+# its live directory and runtime files never move while an initializer runs.
+while IFS= read -r -d '' entry; do
+  name="$(basename "$entry")"
+  case "$name" in
+    .git|.jj|vendor|scripts) continue ;;
+  esac
+  original_entries+=("$name")
+done < <(find "$repo_root" -mindepth 1 -maxdepth 1 -print0)
+while IFS= read -r -d '' entry; do
+  name="$(basename "$entry")"
+  [ "$name" = scripts ] && continue
+  staged_entries+=("$name")
+done < <(find "$stage_root" -mindepth 1 -maxdepth 1 -print0)
+backup_root="$(mktemp -d "$parent_root/.$(basename "$repo_root").init-backup.XXXXXXXX")"
+swap_started=1
+for relative in "${original_entries[@]}"; do
+  mkdir -p -- "$(dirname "$backup_root/$relative")"
+  mv -- "$repo_root/$relative" "$backup_root/$relative"
+  evacuated_paths+=("$relative")
+  if [ "$failure_stage" = evacuate ] && [ "${#evacuated_paths[@]}" -eq 1 ]; then
+    die "injected initializer failure at stage 'evacuate'"
+  fi
+done
+commit_moves=0
+for relative in "${staged_entries[@]}"; do
+  mkdir -p -- "$(dirname "$repo_root/$relative")"
+  mv -- "$stage_root/$relative" "$repo_root/$relative"
+  installed_paths+=("$relative")
+  commit_moves=$((commit_moves + 1))
+  if { [ "$failure_stage" = commit ] || [ "$failure_stage" = restore ]; } && [ "$commit_moves" -eq 1 ]; then
+    die "injected initializer failure at stage '$failure_stage'"
+  fi
+done
+apply_scripts_stage
+swap_complete=1
 
 echo ""
 echo "Done. Next steps:"
@@ -212,8 +457,11 @@ echo "  5. Releasing: push a vX.Y.Z tag — no secret needed (proxy.golang.org a
 echo "     pkg.go.dev pick it up). Delete .github/workflows/release.yml if not publishing."
 echo "  6. Fill the Architecture section of CLAUDE.md, then commit."
 
-# 5) Remove both initializers unless asked to keep them.
+# These are the only live-tree deletions. They happen after the swap, so a locked
+# file leaves a complete initialized tree that is safe to retry.
 if [ "$keep_script" -ne 1 ]; then
-  rm -f "$sibling_ps1"
+  rm -f "$test_harness" "$sibling_ps1"
   rm -f "$self"
+else
+  rm -f "$test_harness"
 fi
