@@ -29,6 +29,16 @@ release pipeline, and conventions for agents in [CLAUDE.md](CLAUDE.md) /
    required is missing it lists the install commands for your OS and exits non-zero —
    install what it names, then re-run it. **Don't run init until it reports the
    environment is ready.**
+
+   Template maintainers can also run the disposable initializer harness before
+   initialization:
+
+   ```bash
+   bash ./scripts/test-init.sh
+   ```
+
+   The initializer deletes this harness even when `-KeepScript` / `--keep-script`
+   is used, so it is not a generated-repository verification step.
 3. Run the init script once to stamp your project name in. Use whichever matches
    your shell — both do the same thing:
 
@@ -46,11 +56,22 @@ release pipeline, and conventions for agents in [CLAUDE.md](CLAUDE.md) /
    in the `go.mod` module path and repository URLs, and a **Go package identifier**
    (lowercase, alphanumerics only; e.g. `acmewidgets`) used in the `package`
    declarations. Name your GitHub repository with the slug the script prints (or edit
-   `go.mod`'s module path to match your real remote). The script also activates
-   `.claude/settings.json` from its `.template` form, deletes this `TEMPLATE.md` and
-   `docs/AGENT-INIT-GUIDE.md`, and (unless `-KeepScript` / `--keep-script`) removes
+   `go.mod`'s module path to match your real remote). If no
+   `.claude/settings.json` exists, the script activates it from its `.template`
+   form; otherwise it preserves the existing config byte-for-byte and leaves the
+   template in place. It deletes this `TEMPLATE.md`, `docs/AGENT-INIT-GUIDE.md`, and
+   the disposable initializer test harness. Changes
+   are staged before they are applied. If rollback is interrupted, a retry first
+   restores and verifies the one unresolved backup beside the repository, removes
+   it, and only then creates a new stage; multiple backups or a restore collision
+   fail closed with recovery details instead of initializing a partial tree. Unless
+   `-KeepScript` / `--keep-script`, it also removes
    **both** initializers (`check-env.{ps1,sh}` stay — they double as a contributor
    onboarding check).
+   Both initializers validate all release identity inputs before changing any files:
+   `GitHubOwner` / `--github-owner` must be 1–39 ASCII letters, digits, or interior
+   hyphens, and the author and email values must not contain control characters or
+   shell/YAML syntax characters. Re-run with corrected values if validation fails.
 4. Verify:
 
    ```sh

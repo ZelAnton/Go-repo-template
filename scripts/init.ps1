@@ -9,8 +9,9 @@
     Replaces the placeholder tokens (__ProjectName__, __GoPackage__, __Author__,
     __AuthorEmail__, __GitHubOwner__, __Description__, __Year__) in file contents
     AND in file/folder names, then removes the template-only files (TEMPLATE.md,
-    docs/AGENT-INIT-GUIDE.md, and — unless -KeepScript — both initializers,
-    init.ps1 and init.sh).
+    docs/AGENT-INIT-GUIDE.md, and the disposable initializer test harness) and —
+    unless -KeepScript — both initializers, init.ps1 and init.sh. Changes are
+    prepared in a staging tree and committed with rollback protection.
 
     Run it once, right after creating a repository from the template:
 
@@ -48,7 +49,7 @@
 
 .PARAMETER KeepScript
     Keep both initializers (init.ps1 and init.sh) after running. TEMPLATE.md and
-    docs/AGENT-INIT-GUIDE.md are removed either way.
+    docs/AGENT-INIT-GUIDE.md and the disposable test harness are removed either way.
 
 .EXAMPLE
     pwsh ./scripts/init.ps1 -ProjectName my-widgets -Author "Jane Doe" -GitHubOwner acme -Description "A small module"
@@ -96,12 +97,39 @@ if (-not $AuthorEmail) {
 if (-not $GitHubOwner) { $GitHubOwner = 'your-org' }
 if (-not $Description) { $Description = 'TODO: project description' }
 
+function Assert-SafeReleaseValue([string]$value, [string]$parameterName) {
+    if ([string]::IsNullOrEmpty($value) -or $value -match '[\x00-\x1F\x7F]') {
+        throw "Invalid -$parameterName. It must not be empty or contain control characters (including quotes, backslashes, or newlines)."
+    }
+
+    # These characters could terminate the workflow's POSIX shell/YAML string or
+    # introduce expansion. Single quotes remain valid in the surrounding shell
+    # double-quoted value, so ordinary names such as O'Connor are accepted.
+    if ($value.IndexOfAny([char[]]('"', '\', '$', '`', ';', '&', '|', '<', '>', '(', ')', '{', '}', '[', ']', '!', '*', '?')) -ge 0) {
+        throw "Invalid -$parameterName '$value'. It contains a character that is unsafe in the generated release workflow."
+    }
+}
+
+Assert-SafeReleaseValue $Author 'Author'
+Assert-SafeReleaseValue $AuthorEmail 'AuthorEmail'
+Assert-SafeReleaseValue $GitHubOwner 'GitHubOwner'
+if ($AuthorEmail -notmatch '^[^@\s]+@[^@\s]+$') {
+    throw "Invalid -AuthorEmail '$AuthorEmail'. Supply an email address such as you@example.com."
+}
+if ($GitHubOwner -notmatch '\A[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?\z') {
+    throw "Invalid -GitHubOwner '$GitHubOwner'. It must be 1-39 ASCII letters, digits, or interior hyphens."
+}
+
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $selfPath = $PSCommandPath
+$siblingSh = Join-Path $PSScriptRoot 'init.sh'
+$testHarness = Join-Path $PSScriptRoot 'test-init.sh'
+$failureStage = $env:TEMPLATE_INIT_FAIL_AT
+$parentRoot = Split-Path -Parent $repoRoot
+$transactionPrefix = '.' + (Split-Path -Leaf $repoRoot) + '.init-backup'
 
-# Go has no quoted-string manifest fields for these values (go.mod's module path is
-# the derived slug; author/description land in plain-text files), so substitution
-# uses raw values everywhere — no per-file-type escaping.
+# Author and email are validated for the shell/YAML context used by release.yml;
+# the remaining values are either derived identifiers or plain-text fields.
 $replacements = [ordered]@{
     '__ProjectName__' = $slug
     '__GoPackage__'   = $goPackage
@@ -111,92 +139,364 @@ $replacements = [ordered]@{
     '__Description__' = $Description
     '__Year__'        = "$Year"
 }
+$tokenPattern = '__ProjectName__|__GoPackage__|__Author__|__AuthorEmail__|__GitHubOwner__|__Description__|__Year__'
+$tokenEvaluator = [System.Text.RegularExpressions.MatchEvaluator]{
+    param([System.Text.RegularExpressions.Match]$match)
+    $replacements[$match.Value]
+}
 
-# Binary files carry no tokens; reading/rewriting them as text would corrupt them.
-$binaryExtensions = @('.png', '.jpg', '.jpeg', '.gif', '.ico', '.zip')
+# Only these UTF-8 text formats participate in content substitution. Unknown asset
+# types stay byte-for-byte untouched instead of relying on a binary denylist.
+$textExtensions = @(
+    '.bat', '.cmd', '.go', '.json', '.md', '.mod', '.ps1', '.psd1', '.psm1',
+    '.sh', '.sum', '.template', '.toml', '.txt', '.yaml', '.yml'
+)
+$textNames = @('.editorconfig', '.gitattributes', '.gitignore', 'codeowners', 'dockerfile', 'license', 'makefile')
 
+# Within supported formats, NUL bytes and invalid UTF-8 still identify binary or
+# mixed content that must not be decoded and rewritten.
+$utf8 = [System.Text.UTF8Encoding]::new($false, $true)
 $excludedDirs = @('.git', '.jj', 'vendor')
+$excludedTopLevel = $excludedDirs
+$runtimeScripts = @('scripts/init.ps1', 'scripts/init.sh', 'scripts/test-init.sh')
+$stageRoot = $null
+$backupRoot = $null
+$swapComplete = $false
+$swapStarted = $false
+$rollbackComplete = $false
+$evacuatedPaths = [System.Collections.Generic.List[string]]::new()
+$installedPaths = [System.Collections.Generic.List[string]]::new()
 
-function Test-Excluded([string]$fullPath) {
-    $rel = $fullPath.Substring($repoRoot.Length).TrimStart('\', '/')
-    foreach ($seg in ($rel -split '[\\/]')) {
-        if ($excludedDirs -contains $seg) { return $true }
+function Fail-At([string]$stage) {
+    if ($failureStage -eq $stage) {
+        throw "Injected initializer failure at stage '$stage'."
+    }
+}
+
+function Remove-PathIfPresent([string]$path) {
+    if (Test-Path -LiteralPath $path) {
+        Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction Stop
+    }
+}
+
+function Copy-TemplateTree([string]$sourceRoot, [string]$destinationRoot) {
+    foreach ($item in (Get-ChildItem -LiteralPath $sourceRoot -Force)) {
+        if ($excludedTopLevel -contains $item.Name) { continue }
+        Copy-Item -LiteralPath $item.FullName -Destination $destinationRoot -Recurse -Force -ErrorAction Stop
+    }
+}
+
+function Test-Excluded([string]$root, [string]$fullPath) {
+    $relativePath = $fullPath.Substring($root.Length).TrimStart('\', '/')
+    foreach ($segment in ($relativePath -split '[\\/]')) {
+        if ($excludedDirs -contains $segment) { return $true }
     }
     return $false
 }
 
+function Test-RuntimeScript([string]$root, [string]$fullPath) {
+    $relativePath = $fullPath.Substring($root.Length).TrimStart('\', '/').Replace('\', '/')
+    return $runtimeScripts -contains $relativePath
+}
+
+function Restore-UnresolvedBackup {
+    $candidates = @(
+        Get-ChildItem -LiteralPath $parentRoot -Directory -Force |
+            Where-Object { $_.Name.StartsWith($transactionPrefix, [StringComparison]::Ordinal) }
+    )
+    if ($candidates.Count -gt 1) {
+        throw "Found $($candidates.Count) unresolved initializer backups beside '$repoRoot'; refusing to choose one automatically."
+    }
+    if ($candidates.Count -eq 0) { return }
+
+    $candidate = $candidates[0].FullName
+    Write-Host "==> Recovering interrupted rollback from '$candidate'" -ForegroundColor Yellow
+    $recoveredPaths = [System.Collections.Generic.List[string]]::new()
+
+    # Ordinary scripts entries are backed up below a scripts container because the
+    # live scripts directory itself must remain in place while an initializer runs.
+    $savedScripts = Join-Path $candidate 'scripts'
+    if (Test-Path -LiteralPath $savedScripts -PathType Container) {
+        $liveScripts = Join-Path $repoRoot 'scripts'
+        New-Item -ItemType Directory -Path $liveScripts -Force | Out-Null
+        foreach ($entry in @(Get-ChildItem -LiteralPath $savedScripts -Force)) {
+            $relativePath = 'scripts/' + $entry.Name
+            $target = Join-Path $repoRoot $relativePath
+            if (Test-Path -LiteralPath $target) {
+                throw "Cannot recover '$candidate': restore target '$target' already exists."
+            }
+            try {
+                Move-Item -LiteralPath $entry.FullName -Destination $target -ErrorAction Stop
+            }
+            catch {
+                throw "Cannot recover '$candidate': failed to restore '$relativePath': $($_.Exception.Message)"
+            }
+            $recoveredPaths.Add($relativePath)
+        }
+        Remove-Item -LiteralPath $savedScripts -Force -ErrorAction Stop
+    }
+
+    foreach ($entry in @(Get-ChildItem -LiteralPath $candidate -Force)) {
+        $target = Join-Path $repoRoot $entry.Name
+        if (Test-Path -LiteralPath $target) {
+            throw "Cannot recover '$candidate': restore target '$target' already exists."
+        }
+        try {
+            Move-Item -LiteralPath $entry.FullName -Destination $repoRoot -ErrorAction Stop
+        }
+        catch {
+            throw "Cannot recover '$candidate': failed to restore '$($entry.Name)': $($_.Exception.Message)"
+        }
+        $recoveredPaths.Add($entry.Name)
+    }
+
+    foreach ($relativePath in $recoveredPaths) {
+        if (-not (Test-Path -LiteralPath (Join-Path $repoRoot $relativePath))) {
+            throw "Cannot verify restored entry '$relativePath'; backup remains at '$candidate'."
+        }
+    }
+    if (Get-ChildItem -LiteralPath $candidate -Force) {
+        throw "Cannot verify that recovery backup '$candidate' is empty."
+    }
+    Remove-Item -LiteralPath $candidate -Force -ErrorAction Stop
+}
+
+function Rollback-Swap {
+    foreach ($relativePath in $installedPaths) {
+        $installed = Join-Path $repoRoot $relativePath
+        Remove-PathIfPresent $installed
+        if (Test-Path -LiteralPath $installed) {
+            throw "Rollback could not remove installed entry '$installed'."
+        }
+    }
+
+    $restored = 0
+    foreach ($relativePath in $evacuatedPaths) {
+        $saved = Join-Path $backupRoot $relativePath
+        $target = Join-Path $repoRoot $relativePath
+        if (-not (Test-Path -LiteralPath $saved)) {
+            throw "Rollback backup entry is missing: '$saved'."
+        }
+        if (Test-Path -LiteralPath $target) {
+            throw "Rollback restore target already exists: '$target'."
+        }
+        $targetParent = Split-Path -Parent $target
+        New-Item -ItemType Directory -Path $targetParent -Force | Out-Null
+        Move-Item -LiteralPath $saved -Destination $target -ErrorAction Stop
+        $restored++
+        if ($failureStage -eq 'restore' -and $restored -eq 1) {
+            throw "Injected initializer failure at stage 'restore'."
+        }
+    }
+
+    foreach ($relativePath in $evacuatedPaths) {
+        if ((Test-Path -LiteralPath (Join-Path $backupRoot $relativePath)) -or
+            -not (Test-Path -LiteralPath (Join-Path $repoRoot $relativePath))) {
+            throw "Rollback could not verify restored entry '$relativePath'."
+        }
+    }
+}
+
+function Apply-ScriptsStage {
+    $liveScripts = Join-Path $repoRoot 'scripts'
+    $stagedScripts = Join-Path $stageRoot 'scripts'
+    $savedScripts = Join-Path $backupRoot 'scripts'
+    $runtimeNames = @('init.ps1', 'init.sh', 'test-init.sh')
+    $scriptEvacuations = 0
+    $scriptInstalls = 0
+
+    New-Item -ItemType Directory -Path $liveScripts -Force | Out-Null
+    New-Item -ItemType Directory -Path $savedScripts -Force | Out-Null
+
+    # Keep the live directory and runtime scripts in place. Only ordinary direct
+    # children move; a token-named directory carries its transformed descendants.
+    foreach ($entry in @(Get-ChildItem -LiteralPath $liveScripts -Force)) {
+        if ($runtimeNames -contains $entry.Name) { continue }
+        $relativePath = 'scripts/' + $entry.Name
+        $savedPath = Join-Path $backupRoot $relativePath
+        Move-Item -LiteralPath $entry.FullName -Destination $savedPath -ErrorAction Stop
+        $evacuatedPaths.Add($relativePath)
+        $scriptEvacuations++
+        if ($failureStage -eq 'remove-scripts' -and $scriptEvacuations -eq 1) {
+            throw "Injected initializer failure at stage 'remove-scripts'."
+        }
+    }
+
+    foreach ($entry in @(Get-ChildItem -LiteralPath $stagedScripts -Force)) {
+        if ($runtimeNames -contains $entry.Name) { continue }
+        $relativePath = 'scripts/' + $entry.Name
+        $targetPath = Join-Path $repoRoot $relativePath
+        if (Test-Path -LiteralPath $targetPath) {
+            throw "Cannot install staged script entry '$relativePath': target '$targetPath' already exists."
+        }
+        Move-Item -LiteralPath $entry.FullName -Destination $targetPath -ErrorAction Stop
+        $installedPaths.Add($relativePath)
+        $scriptInstalls++
+        if ($failureStage -eq 'scripts' -and $scriptInstalls -eq 1) {
+            throw "Injected initializer failure at stage 'scripts'."
+        }
+    }
+}
+
 Write-Host "==> Initializing template as '$slug' (package '$goPackage')" -ForegroundColor Cyan
 
-# 1) Replace tokens in file contents. Both initializers are skipped: they carry the
-#    literal token strings as search keys, so substituting inside them would corrupt
-#    the sibling script.
-$siblingSh = Join-Path $PSScriptRoot 'init.sh'
-# -Force includes hidden-attributed files (Windows checkouts sometimes hidden-flag
-# dot-entries) so this pass sees exactly what init.sh's `find` sees; .git/.jj/vendor
-# stay excluded via Test-Excluded.
-$files = Get-ChildItem -Path $repoRoot -File -Recurse -Force | Where-Object {
-    -not (Test-Excluded $_.FullName) -and $_.FullName -ne $selfPath -and $_.FullName -ne $siblingSh
-}
-$contentChanged = 0
-foreach ($file in $files) {
-    if ($binaryExtensions -contains $file.Extension) { continue }
-    $text = [System.IO.File]::ReadAllText($file.FullName)
-    $new = $text
-    foreach ($key in $replacements.Keys) {
-        $new = $new.Replace($key, $replacements[$key])
+try {
+    Restore-UnresolvedBackup
+
+    # Prepare every change outside the live tree. The stage is adjacent to the
+    # repository so the final moves stay on one filesystem and can be rolled back.
+    $stageRoot = Join-Path $parentRoot ('.' + (Split-Path -Leaf $repoRoot) + '.init-stage-' + [guid]::NewGuid().ToString('N'))
+    $backupRoot = Join-Path $parentRoot ('.' + (Split-Path -Leaf $repoRoot) + '.init-backup-' + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $stageRoot -Force | Out-Null
+    Copy-TemplateTree $repoRoot $stageRoot
+    Fail-At 'copy'
+
+    # Only strict UTF-8 text in supported formats is decoded. Runtime scripts and
+    # existing user settings stay byte-for-byte untouched until final cleanup.
+    $files = Get-ChildItem -Path $stageRoot -File -Recurse -Force | Where-Object {
+        -not (Test-Excluded $stageRoot $_.FullName) -and
+        -not (Test-RuntimeScript $stageRoot $_.FullName) -and
+        $_.FullName -ne (Join-Path $stageRoot '.claude/settings.json')
     }
-    if ($new -ne $text) {
-        # UTF-8 without BOM, LF preserved — matches .gitattributes (eol=lf).
-        [System.IO.File]::WriteAllText($file.FullName, $new, (New-Object System.Text.UTF8Encoding($false)))
-        $contentChanged++
+    $contentChanged = 0
+    foreach ($file in $files) {
+        $lowerName = $file.Name.ToLowerInvariant()
+        $lowerExtension = $file.Extension.ToLowerInvariant()
+        if ($textExtensions -notcontains $lowerExtension -and $textNames -notcontains $lowerName) { continue }
+        $bytes = [System.IO.File]::ReadAllBytes($file.FullName)
+        if ([System.Array]::IndexOf($bytes, [byte]0) -ge 0) { continue }
+        try {
+            $text = $utf8.GetString($bytes)
+        }
+        catch [System.Text.DecoderFallbackException] {
+            continue
+        }
+        # Match only the original source text. Replacement values are emitted by
+        # the evaluator and are never rescanned for additional tokens.
+        $new = [regex]::Replace($text, $tokenPattern, $tokenEvaluator)
+        if ($new -ne $text) {
+            # UTF-8 BOM presence and line endings survive the decode/encode cycle.
+            [System.IO.File]::WriteAllBytes($file.FullName, $utf8.GetBytes($new))
+            $contentChanged++
+        }
+    }
+    Write-Host "    Updated contents in $contentChanged file(s)." -ForegroundColor DarkGray
+    Fail-At 'content'
+
+    # Rename deepest paths first so child renames do not invalidate parent paths.
+    $named = Get-ChildItem -Path $stageRoot -Recurse -Force | Where-Object {
+        -not (Test-Excluded $stageRoot $_.FullName) -and
+        -not (Test-RuntimeScript $stageRoot $_.FullName) -and
+        $_.Name -like '*__ProjectName__*'
+    } | Sort-Object { $_.FullName.Length } -Descending
+    foreach ($item in $named) {
+        $newName = $item.Name.Replace('__ProjectName__', $slug)
+        Rename-Item -LiteralPath $item.FullName -NewName $newName -ErrorAction Stop
+        Write-Host "    Renamed $($item.Name) -> $newName" -ForegroundColor DarkGray
+    }
+    Fail-At 'rename'
+
+    # Activate shared settings only when no user config already exists in the
+    # staged tree. Existing settings are immutable input and remain byte-for-byte.
+    $claudeTemplate = Join-Path $stageRoot '.claude/settings.json.template'
+    $claudeSettings = Join-Path $stageRoot '.claude/settings.json'
+    if (Test-Path -LiteralPath $claudeSettings) {
+        Write-Host "    Preserved existing .claude/settings.json." -ForegroundColor DarkGray
+    }
+    elseif (Test-Path -LiteralPath $claudeTemplate) {
+        Move-Item -LiteralPath $claudeTemplate -Destination (Join-Path $stageRoot '.claude/settings.json') -Force -ErrorAction Stop
+        Write-Host "    Activated .claude/settings.json" -ForegroundColor DarkGray
+    }
+    Fail-At 'activate'
+
+    # Remove template-only files in the staged tree. A failure here cannot affect
+    # the source tree and the complete operation can be retried unchanged.
+    foreach ($rel in @('TEMPLATE.md', 'docs/AGENT-INIT-GUIDE.md')) {
+        Remove-PathIfPresent (Join-Path $stageRoot $rel)
+    }
+    $stagedDocs = Join-Path $stageRoot 'docs'
+    if ((Test-Path -LiteralPath $stagedDocs) -and -not (Get-ChildItem -LiteralPath $stagedDocs -Force)) {
+        Remove-Item -LiteralPath $stagedDocs -Force -ErrorAction Stop
+    }
+    Fail-At 'delete'
+
+    # Swap only mutable top-level entries. scripts/ is applied separately so its
+    # live directory and runtime files never move while an initializer runs.
+    $originalPaths = @(
+        Get-ChildItem -LiteralPath $repoRoot -Force |
+            Where-Object { $excludedTopLevel -notcontains $_.Name -and $_.Name -ne 'scripts' } |
+            Select-Object -ExpandProperty Name
+    )
+    $stagedPaths = @(
+        Get-ChildItem -LiteralPath $stageRoot -Force |
+            Where-Object { $_.Name -ne 'scripts' } |
+            Select-Object -ExpandProperty Name
+    )
+    New-Item -ItemType Directory -Path $backupRoot -Force | Out-Null
+    $swapStarted = $true
+    foreach ($relativePath in $originalPaths) {
+        $backupPath = Join-Path $backupRoot $relativePath
+        New-Item -ItemType Directory -Path (Split-Path -Parent $backupPath) -Force | Out-Null
+        Move-Item -LiteralPath (Join-Path $repoRoot $relativePath) -Destination $backupPath -Force -ErrorAction Stop
+        $evacuatedPaths.Add($relativePath)
+        if ($failureStage -eq 'evacuate' -and $evacuatedPaths.Count -eq 1) {
+            throw "Injected initializer failure at stage 'evacuate'."
+        }
+    }
+    $stagedMoves = 0
+    foreach ($relativePath in $stagedPaths) {
+        $targetPath = Join-Path $repoRoot $relativePath
+        New-Item -ItemType Directory -Path (Split-Path -Parent $targetPath) -Force | Out-Null
+        Move-Item -LiteralPath (Join-Path $stageRoot $relativePath) -Destination $targetPath -Force -ErrorAction Stop
+        $installedPaths.Add($relativePath)
+        $stagedMoves++
+        if (($failureStage -eq 'commit' -or $failureStage -eq 'restore') -and $stagedMoves -eq 1) {
+            throw "Injected initializer failure at stage '$failureStage'."
+        }
+    }
+    Apply-ScriptsStage
+    $swapComplete = $true
+
+    Write-Host ""
+    Write-Host "Done. Next steps:" -ForegroundColor Green
+    Write-Host "  1. go build ./... && go test ./..."
+    Write-Host "  2. gofmt -w . && go vet ./..."
+    Write-Host "  3. Review LICENSE (author/year) and the module path in go.mod."
+    Write-Host "  4. Replace greeter.go (and greeter_test.go) with your real API."
+    Write-Host "  5. Releasing: push a vX.Y.Z tag — no secret needed (proxy.golang.org and"
+    Write-Host "     pkg.go.dev pick it up). Delete .github/workflows/release.yml if not publishing."
+    Write-Host "  6. Fill the Architecture section of CLAUDE.md, then commit."
+
+    # These are the only live-tree deletions. They happen after the swap, so a
+    # locked file leaves a complete initialized tree that is safe to retry.
+    if (-not $KeepScript) {
+        if (Test-Path -LiteralPath $testHarness) { Remove-Item -LiteralPath $testHarness -Force -ErrorAction Stop }
+        if (Test-Path -LiteralPath $siblingSh) { Remove-Item -LiteralPath $siblingSh -Force -ErrorAction Stop }
+        Remove-Item -LiteralPath $selfPath -Force -ErrorAction Stop
+    } elseif (Test-Path -LiteralPath $testHarness) {
+        Remove-Item -LiteralPath $testHarness -Force -ErrorAction Stop
     }
 }
-Write-Host "    Updated contents in $contentChanged file(s)." -ForegroundColor DarkGray
-
-# 2) Rename files and folders whose name contains the project-name token.
-#    Deepest paths first so child renames don't invalidate parent paths. The flat
-#    Go layout has none, but a cmd/__ProjectName__ adaptation would, so support it.
-$named = Get-ChildItem -Path $repoRoot -Recurse -Force | Where-Object {
-    -not (Test-Excluded $_.FullName) -and $_.Name -like '*__ProjectName__*'
-} | Sort-Object { $_.FullName.Length } -Descending
-foreach ($item in $named) {
-    $newName = $item.Name.Replace('__ProjectName__', $slug)
-    Rename-Item -LiteralPath $item.FullName -NewName $newName
-    Write-Host "    Renamed $($item.Name) -> $newName" -ForegroundColor DarkGray
+catch {
+    $initialFailure = $_
+    if (-not $swapComplete -and $swapStarted) {
+        try {
+            Rollback-Swap
+            $rollbackComplete = $true
+        }
+        catch {
+            throw "Initializer failed: $($initialFailure.Exception.Message) Rollback also failed: $($_.Exception.Message) Original entries remain recoverable at '$backupRoot'."
+        }
+    }
+    throw $initialFailure
 }
-
-# 3) Activate Claude Code shared settings from the shipped .template (renames
-#    .claude/settings.json.template -> .claude/settings.json).
-$claudeTemplate = Join-Path $repoRoot '.claude/settings.json.template'
-if (Test-Path $claudeTemplate) {
-    Move-Item -LiteralPath $claudeTemplate -Destination (Join-Path $repoRoot '.claude/settings.json') -Force
-    Write-Host "    Activated .claude/settings.json" -ForegroundColor DarkGray
-}
-
-# 4) Remove template-only files.
-$templateOnly = @('TEMPLATE.md', 'docs/AGENT-INIT-GUIDE.md')
-foreach ($rel in $templateOnly) {
-    $p = Join-Path $repoRoot $rel
-    if (Test-Path $p) { Remove-Item -LiteralPath $p -Force }
-}
-# Drop docs/ if it's now empty.
-$docsDir = Join-Path $repoRoot 'docs'
-if ((Test-Path $docsDir) -and -not (Get-ChildItem -LiteralPath $docsDir -Force)) {
-    Remove-Item -LiteralPath $docsDir -Force
-}
-
-Write-Host ""
-Write-Host "Done. Next steps:" -ForegroundColor Green
-Write-Host "  1. go build ./... && go test ./..."
-Write-Host "  2. gofmt -w . && go vet ./..."
-Write-Host "  3. Review LICENSE (author/year) and the module path in go.mod."
-Write-Host "  4. Replace greeter.go (and greeter_test.go) with your real API."
-Write-Host "  5. Releasing: push a vX.Y.Z tag — no secret needed (proxy.golang.org and"
-Write-Host "     pkg.go.dev pick it up). Delete .github/workflows/release.yml if not publishing."
-Write-Host "  6. Fill the Architecture section of CLAUDE.md, then commit."
-
-# Remove both initializers unless asked to keep them.
-if (-not $KeepScript) {
-    if (Test-Path $siblingSh) { Remove-Item -LiteralPath $siblingSh -Force }
-    Remove-Item -LiteralPath $selfPath -Force
+finally {
+    if ($stageRoot) { Remove-PathIfPresent $stageRoot }
+    if ($backupRoot -and (Test-Path -LiteralPath $backupRoot)) {
+        if (-not $swapStarted -or $swapComplete -or $rollbackComplete) {
+            Remove-PathIfPresent $backupRoot
+        } else {
+            Write-Warning "Preserving incomplete rollback backup at '$backupRoot'."
+        }
+    }
 }

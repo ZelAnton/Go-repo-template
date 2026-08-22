@@ -24,7 +24,8 @@ gone wrong in avoidable ways. **Read it before touching any files.**
    PowerShell cmdlets fail there. Use the PowerShell tool for cmdlets.
 5. **Don't fight the permission model.** `.claude/settings.json` ships as a
    `.template`; activating it is the script's / user's job, not something you force by
-   writing allow-rules yourself.
+   writing allow-rules yourself. If the user already has `settings.json`, the
+   initializer preserves it byte-for-byte and leaves the template unactivated.
 6. **Verify, then clean.** `go build ./...` + `go test ./...`, then remove build
    artifacts before finishing.
 7. **Keep agent files local.** In the *new* repo, git-ignore and untrack the
@@ -65,9 +66,17 @@ Confirm these facts by reading, not by assuming:
    ```
 
    `-ProjectName` is required; the rest fall back to sensible defaults. The script
-   derives the module slug + Go package id, substitutes tokens, activates
-   `.claude/settings.json` from its `.template`, and deletes `TEMPLATE.md` (and itself
-   unless `-KeepScript`).
+   derives the module slug + Go package id, prepares substitutions, renames, settings,
+   and template-file removals in a staging tree, then applies them with rollback
+   protection. If rollback is interrupted, retry directly: before staging, the
+   initializer automatically restores and verifies the single unresolved backup
+   beside the repository and removes it. Multiple backups or a restore collision
+   fail closed with recovery details, so a retry never initializes from a known
+   partial tree. It deletes `TEMPLATE.md`, this guide, and the disposable
+   `scripts/test-init.sh` (and both initializers unless `-KeepScript`). Release
+   identity values are validated before staging; correct rejected values and retry.
+   The settings template is activated only when no `.claude/settings.json` already
+   exists; an existing config is preserved byte-for-byte, including on retry.
 4. **Verify**: `go build ./...` then `go test ./...`.
 5. Replace the placeholder `Greet` function with the real API, delete or rewrite the
    sample test, fill in the `CLAUDE.md` "Architecture" section, and work through the
