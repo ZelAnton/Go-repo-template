@@ -345,6 +345,69 @@ run_non_recursive_substitution_test() {
   assert_not_contains "$unsafe_description" "$copy/LICENSE"
 }
 
+write_user_settings() {
+  local destination="$1"
+  # BOM + CRLF and a token-looking value catch text rewrites as well as clobbers.
+  printf '\357\273\277{\r\n  "literal": "__ProjectName__"\r\n}\r\n' > "$destination"
+}
+
+assert_settings_output() {
+  local log="$1"
+  local expected="$2"
+  local actual
+  actual="$(grep -F -- '.claude/settings.json' "$log" || true)"
+  [ "$actual" = "$expected" ] || fail "unexpected settings output in $log: '$actual'"
+}
+
+run_existing_settings_test() {
+  local initializer="$1"
+  local copy="$tmp_root/$initializer-existing-settings"
+  local expected_settings="$tmp_root/$initializer-existing-settings-expected"
+  local expected_template="$tmp_root/$initializer-existing-template-expected"
+  local log="$tmp_root/$initializer-existing-settings.log"
+
+  copy_template "$copy"
+  write_user_settings "$copy/.claude/settings.json"
+  cp -- "$copy/.claude/settings.json" "$expected_settings"
+  cp -- "$copy/.claude/settings.json.template" "$expected_template"
+  run_initializer "$initializer" "$copy" 1 >"$log" 2>&1
+
+  cmp -- "$expected_settings" "$copy/.claude/settings.json" >/dev/null ||
+    fail "$initializer changed existing settings"
+  cmp -- "$expected_template" "$copy/.claude/settings.json.template" >/dev/null ||
+    fail "$initializer changed the unactivated template"
+  assert_settings_output "$log" '    Preserved existing .claude/settings.json.'
+  echo "PASS $initializer existing settings"
+}
+
+run_absent_settings_and_retry_test() {
+  local initializer="$1"
+  local copy="$tmp_root/$initializer-absent-settings-retry"
+  local expected_template="$tmp_root/$initializer-absent-template"
+  local expected_retry="$tmp_root/$initializer-retry-settings"
+  local first_log="$tmp_root/$initializer-absent-settings.log"
+  local retry_log="$tmp_root/$initializer-retry-settings.log"
+
+  copy_template "$copy"
+  cp -- "$copy/.claude/settings.json.template" "$expected_template"
+  run_initializer "$initializer" "$copy" 1 >"$first_log" 2>&1
+
+  test ! -e "$copy/.claude/settings.json.template" ||
+    fail "$initializer retained the activated template"
+  cmp -- "$expected_template" "$copy/.claude/settings.json" >/dev/null ||
+    fail "$initializer did not activate the template unchanged"
+  assert_settings_output "$first_log" '    Activated .claude/settings.json'
+
+  write_user_settings "$copy/.claude/settings.json"
+  cp -- "$copy/.claude/settings.json" "$expected_retry"
+  run_initializer "$initializer" "$copy" 1 >"$retry_log" 2>&1
+
+  cmp -- "$expected_retry" "$copy/.claude/settings.json" >/dev/null ||
+    fail "$initializer changed settings on retry"
+  assert_settings_output "$retry_log" '    Preserved existing .claude/settings.json.'
+  echo "PASS $initializer absent settings + retry"
+}
+
 stages='copy content rename activate delete evacuate commit remove-scripts scripts'
 tested_initializers=0
 for initializer in sh ps1; do
@@ -362,7 +425,9 @@ for initializer in sh ps1; do
   run_non_recursive_substitution_test "$initializer"
   run_identity_rejection_test "$initializer"
   run_owner_rejection_test "$initializer"
+  run_existing_settings_test "$initializer"
+  run_absent_settings_and_retry_test "$initializer"
 done
 
 [ "$tested_initializers" -gt 0 ] || fail 'no initializer was available'
-echo "initializer tests passed: $tested_initializers initializer(s), transactional and identity checks complete"
+echo "initializer tests passed: $tested_initializers initializer(s), transactional, identity, and settings checks complete"

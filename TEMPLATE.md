@@ -46,9 +46,11 @@ release pipeline, and conventions for agents in [CLAUDE.md](CLAUDE.md) /
    in the `go.mod` module path and repository URLs, and a **Go package identifier**
    (lowercase, alphanumerics only; e.g. `acmewidgets`) used in the `package`
    declarations. Name your GitHub repository with the slug the script prints (or edit
-   `go.mod`'s module path to match your real remote). The script also activates
-   `.claude/settings.json` from its `.template` form, deletes this `TEMPLATE.md` and
-   `docs/AGENT-INIT-GUIDE.md`, and the disposable initializer test harness. Changes
+   `go.mod`'s module path to match your real remote). If no
+   `.claude/settings.json` exists, the script activates it from its `.template`
+   form; otherwise it preserves the existing config byte-for-byte and leaves the
+   template in place. It deletes this `TEMPLATE.md`, `docs/AGENT-INIT-GUIDE.md`, and
+   the disposable initializer test harness. Changes
    are staged before they are applied. If rollback is interrupted, a retry first
    restores and verifies the one unresolved backup beside the repository, removes
    it, and only then creates a new stage; multiple backups or a restore collision

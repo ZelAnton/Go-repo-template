@@ -346,7 +346,8 @@ try {
     # stay untouched until final cleanup.
     $files = Get-ChildItem -Path $stageRoot -File -Recurse -Force | Where-Object {
         -not (Test-Excluded $stageRoot $_.FullName) -and
-        -not (Test-RuntimeScript $stageRoot $_.FullName)
+        -not (Test-RuntimeScript $stageRoot $_.FullName) -and
+        $_.FullName -ne (Join-Path $stageRoot '.claude/settings.json')
     }
     $contentChanged = 0
     foreach ($file in $files) {
@@ -377,9 +378,14 @@ try {
     }
     Fail-At 'rename'
 
-    # Activate Claude Code shared settings in the staged tree.
+    # Activate shared settings only when no user config already exists in the
+    # staged tree. Existing settings are immutable input and remain byte-for-byte.
     $claudeTemplate = Join-Path $stageRoot '.claude/settings.json.template'
-    if (Test-Path -LiteralPath $claudeTemplate) {
+    $claudeSettings = Join-Path $stageRoot '.claude/settings.json'
+    if (Test-Path -LiteralPath $claudeSettings) {
+        Write-Host "    Preserved existing .claude/settings.json." -ForegroundColor DarkGray
+    }
+    elseif (Test-Path -LiteralPath $claudeTemplate) {
         Move-Item -LiteralPath $claudeTemplate -Destination (Join-Path $stageRoot '.claude/settings.json') -Force -ErrorAction Stop
         Write-Host "    Activated .claude/settings.json" -ForegroundColor DarkGray
     }

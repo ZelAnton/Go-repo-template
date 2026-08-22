@@ -357,6 +357,7 @@ changed=0
 while IFS= read -r -d '' file; do
   case "$file" in
     "$stage_root/scripts/init.sh"|"$stage_root/scripts/init.ps1"|"$stage_root/scripts/test-init.sh") continue ;;
+    "$stage_root/.claude/settings.json") continue ;;
   esac
   # Skip binary files (NUL bytes get stripped through command substitution).
   case "$file" in
@@ -397,8 +398,11 @@ while IFS= read -r -d '' item; do
 done < <(find "$stage_root" -depth -name '*__ProjectName__*' -print0)
 fail_at rename
 
-# 3) Activate the Claude Code shared settings in the staged tree.
-if [ -f "$stage_root/.claude/settings.json.template" ]; then
+# 3) Activate shared settings only when no user config already exists in the
+#    staged tree. Existing settings are immutable input and remain byte-for-byte.
+if [ -f "$stage_root/.claude/settings.json" ]; then
+  echo "    Preserved existing .claude/settings.json."
+elif [ -f "$stage_root/.claude/settings.json.template" ]; then
   mv -f "$stage_root/.claude/settings.json.template" "$stage_root/.claude/settings.json"
   echo "    Activated .claude/settings.json"
 fi
