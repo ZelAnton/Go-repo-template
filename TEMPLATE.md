@@ -46,11 +46,13 @@ release pipeline, and conventions for agents in [CLAUDE.md](CLAUDE.md) /
    in the `go.mod` module path and repository URLs, and a **Go package identifier**
    (lowercase, alphanumerics only; e.g. `acmewidgets`) used in the `package`
    declarations. Name your GitHub repository with the slug the script prints (or edit
-   `go.mod`'s module path to match your real remote). The script also activates
-   `.claude/settings.json` from its `.template` form, deletes this `TEMPLATE.md` and
-   `docs/AGENT-INIT-GUIDE.md`, and (unless `-KeepScript` / `--keep-script`) removes
-   **both** initializers (`check-env.{ps1,sh}` stay — they double as a contributor
-   onboarding check).
+   `go.mod`'s module path to match your real remote). If no
+   `.claude/settings.json` exists, the script activates it from its `.template`
+   form; otherwise it preserves the existing config byte-for-byte and leaves the
+   template in place. It deletes this `TEMPLATE.md`, `docs/AGENT-INIT-GUIDE.md`, and
+   the disposable initializer test harness, and (unless `-KeepScript` /
+   `--keep-script`) removes **both** initializers (`check-env.{ps1,sh}` stay — they
+   double as a contributor onboarding check).
 4. Verify:
 
    ```sh

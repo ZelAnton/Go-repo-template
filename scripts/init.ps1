@@ -9,8 +9,8 @@
     Replaces the placeholder tokens (__ProjectName__, __GoPackage__, __Author__,
     __AuthorEmail__, __GitHubOwner__, __Description__, __Year__) in file contents
     AND in file/folder names, then removes the template-only files (TEMPLATE.md,
-    docs/AGENT-INIT-GUIDE.md, and — unless -KeepScript — both initializers,
-    init.ps1 and init.sh).
+    docs/AGENT-INIT-GUIDE.md, scripts/test-init.sh, and — unless -KeepScript —
+    both initializers, init.ps1 and init.sh).
 
     Run it once, right after creating a repository from the template:
 
@@ -48,7 +48,7 @@
 
 .PARAMETER KeepScript
     Keep both initializers (init.ps1 and init.sh) after running. TEMPLATE.md and
-    docs/AGENT-INIT-GUIDE.md are removed either way.
+    docs/AGENT-INIT-GUIDE.md and scripts/test-init.sh are removed either way.
 
 .EXAMPLE
     pwsh ./scripts/init.ps1 -ProjectName my-widgets -Author "Jane Doe" -GitHubOwner acme -Description "A small module"
@@ -98,6 +98,7 @@ if (-not $Description) { $Description = 'TODO: project description' }
 
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $selfPath = $PSCommandPath
+$claudeSettings = Join-Path $repoRoot '.claude/settings.json'
 
 # Go has no quoted-string manifest fields for these values (go.mod's module path is
 # the derived slug; author/description land in plain-text files), so substitution
@@ -127,15 +128,18 @@ function Test-Excluded([string]$fullPath) {
 
 Write-Host "==> Initializing template as '$slug' (package '$goPackage')" -ForegroundColor Cyan
 
-# 1) Replace tokens in file contents. Both initializers are skipped: they carry the
-#    literal token strings as search keys, so substituting inside them would corrupt
-#    the sibling script.
+# 1) Replace tokens in file contents. Both initializers and the disposable test
+#    harness are skipped because they carry literal token strings as search keys.
+#    An existing user settings file is also immutable input, not template content.
 $siblingSh = Join-Path $PSScriptRoot 'init.sh'
+$testHarness = Join-Path $PSScriptRoot 'test-init.sh'
 # -Force includes hidden-attributed files (Windows checkouts sometimes hidden-flag
 # dot-entries) so this pass sees exactly what init.sh's `find` sees; .git/.jj/vendor
 # stay excluded via Test-Excluded.
 $files = Get-ChildItem -Path $repoRoot -File -Recurse -Force | Where-Object {
-    -not (Test-Excluded $_.FullName) -and $_.FullName -ne $selfPath -and $_.FullName -ne $siblingSh
+    -not (Test-Excluded $_.FullName) -and $_.FullName -ne $selfPath -and
+    $_.FullName -ne $siblingSh -and $_.FullName -ne $testHarness -and
+    $_.FullName -ne $claudeSettings
 }
 $contentChanged = 0
 foreach ($file in $files) {
@@ -165,16 +169,21 @@ foreach ($item in $named) {
     Write-Host "    Renamed $($item.Name) -> $newName" -ForegroundColor DarkGray
 }
 
-# 3) Activate Claude Code shared settings from the shipped .template (renames
-#    .claude/settings.json.template -> .claude/settings.json).
+# 3) Activate Claude Code shared settings only when no user config exists.
 $claudeTemplate = Join-Path $repoRoot '.claude/settings.json.template'
-if (Test-Path $claudeTemplate) {
-    Move-Item -LiteralPath $claudeTemplate -Destination (Join-Path $repoRoot '.claude/settings.json') -Force
+if (Test-Path -LiteralPath $claudeSettings) {
+    Write-Host "    Preserved existing .claude/settings.json." -ForegroundColor DarkGray
+}
+elseif (Test-Path -LiteralPath $claudeTemplate) {
+    Move-Item -LiteralPath $claudeTemplate -Destination $claudeSettings -ErrorAction Stop
     Write-Host "    Activated .claude/settings.json" -ForegroundColor DarkGray
+}
+else {
+    Write-Host "    No .claude/settings.json.template to activate." -ForegroundColor DarkGray
 }
 
 # 4) Remove template-only files.
-$templateOnly = @('TEMPLATE.md', 'docs/AGENT-INIT-GUIDE.md')
+$templateOnly = @('TEMPLATE.md', 'docs/AGENT-INIT-GUIDE.md', 'scripts/test-init.sh')
 foreach ($rel in $templateOnly) {
     $p = Join-Path $repoRoot $rel
     if (Test-Path $p) { Remove-Item -LiteralPath $p -Force }

@@ -6,7 +6,8 @@
 # Replaces the placeholder tokens (__ProjectName__, __GoPackage__, __Author__,
 # __AuthorEmail__, __GitHubOwner__, __Description__, __Year__) in file contents AND
 # in file/folder names, then removes the template-only files (TEMPLATE.md,
-# docs/AGENT-INIT-GUIDE.md) and — unless --keep-script — both initializers.
+# docs/AGENT-INIT-GUIDE.md, scripts/test-init.sh) and — unless --keep-script —
+# both initializers.
 #
 # Usage:
 #   bash ./scripts/init.sh --project-name my-widgets \
@@ -88,6 +89,8 @@ script_dir="$(cd "$(dirname "$0")" && pwd)"
 repo_root="$(cd "$script_dir/.." && pwd)"
 self="$script_dir/$(basename "$0")"
 sibling_ps1="$script_dir/init.ps1"
+test_harness="$script_dir/test-init.sh"
+claude_settings="$repo_root/.claude/settings.json"
 
 echo "==> Initializing template as '$slug' (package '$go_package')"
 
@@ -118,13 +121,13 @@ substitute_tokens() {
     }'
 }
 
-# 1) Replace tokens in file contents. Both initializers are skipped: they carry the
-#    literal token strings as search keys, so substituting inside them would corrupt
-#    the sibling script.
+# 1) Replace tokens in file contents. Both initializers and the disposable test
+#    harness are skipped because they carry literal token strings as search keys.
+#    An existing user settings file is also immutable input, not template content.
 changed=0
 while IFS= read -r -d '' file; do
   case "$file" in
-    "$self"|"$sibling_ps1") continue ;;
+    "$self"|"$sibling_ps1"|"$test_harness"|"$claude_settings") continue ;;
   esac
   # Skip binary files (NUL bytes get stripped through command substitution).
   case "$file" in
@@ -159,14 +162,30 @@ while IFS= read -r -d '' item; do
   fi
 done < <(find "$repo_root" -depth -name '*__ProjectName__*' -print0)
 
-# 3) Activate the Claude Code shared settings.
-if [ -f "$repo_root/.claude/settings.json.template" ]; then
-  mv -f "$repo_root/.claude/settings.json.template" "$repo_root/.claude/settings.json"
-  echo "    Activated .claude/settings.json"
+# 3) Activate the Claude Code shared settings only when no user config exists.
+claude_template="$repo_root/.claude/settings.json.template"
+if [ -e "$claude_settings" ] || [ -L "$claude_settings" ]; then
+  echo "    Preserved existing .claude/settings.json."
+elif [ -f "$claude_template" ]; then
+  # A hard link is an atomic no-clobber activation because both paths are in the
+  # same directory. Removing the template leaves the activated file unchanged.
+  if ln "$claude_template" "$claude_settings" 2>/dev/null; then
+    rm -f "$claude_template"
+  elif [ -e "$claude_settings" ] || [ -L "$claude_settings" ]; then
+    echo "    Preserved existing .claude/settings.json."
+    claude_template=""
+  else
+    die "could not activate .claude/settings.json"
+  fi
+  if [ -n "$claude_template" ]; then
+    echo "    Activated .claude/settings.json"
+  fi
+else
+  echo "    No .claude/settings.json.template to activate."
 fi
 
 # 4) Remove template-only files.
-rm -f "$repo_root/TEMPLATE.md" "$repo_root/docs/AGENT-INIT-GUIDE.md"
+rm -f "$repo_root/TEMPLATE.md" "$repo_root/docs/AGENT-INIT-GUIDE.md" "$test_harness"
 rmdir "$repo_root/docs" 2>/dev/null || true
 
 echo ""
