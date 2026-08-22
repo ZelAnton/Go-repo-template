@@ -130,24 +130,24 @@ echo "==> Initializing template as '$slug' (package '$go_package')"
 # derived identifiers or plain-text fields.
 substitute_tokens() {
   awk '
-    function repl(s, tok, val,   out, i) {
-      out = ""
-      while ((i = index(s, tok)) > 0) {
-        out = out substr(s, 1, i - 1) val
-        s = substr(s, i + length(tok))
-      }
-      return out s
+    function replacement(token) {
+      if (token == "__ProjectName__") return ENVIRON["TPL_PROJECT"]
+      if (token == "__GoPackage__") return ENVIRON["TPL_PACKAGE"]
+      if (token == "__Author__") return ENVIRON["TPL_AUTHOR"]
+      if (token == "__AuthorEmail__") return ENVIRON["TPL_AUTHOR_EMAIL"]
+      if (token == "__GitHubOwner__") return ENVIRON["TPL_OWNER"]
+      if (token == "__Description__") return ENVIRON["TPL_DESC"]
+      return ENVIRON["TPL_YEAR"]
     }
     BEGIN {
       s = ENVIRON["TPL_SRC"]
-      s = repl(s, "__ProjectName__", ENVIRON["TPL_PROJECT"])
-      s = repl(s, "__GoPackage__",   ENVIRON["TPL_PACKAGE"])
-      s = repl(s, "__Author__",      ENVIRON["TPL_AUTHOR"])
-      s = repl(s, "__AuthorEmail__", ENVIRON["TPL_AUTHOR_EMAIL"])
-      s = repl(s, "__GitHubOwner__", ENVIRON["TPL_OWNER"])
-      s = repl(s, "__Description__", ENVIRON["TPL_DESC"])
-      s = repl(s, "__Year__",        ENVIRON["TPL_YEAR"])
-      printf "%s", s
+      out = ""
+      while (match(s, /__ProjectName__|__GoPackage__|__Author__|__AuthorEmail__|__GitHubOwner__|__Description__|__Year__/)) {
+        token = substr(s, RSTART, RLENGTH)
+        out = out substr(s, 1, RSTART - 1) replacement(token)
+        s = substr(s, RSTART + RLENGTH)
+      }
+      printf "%s%s", out, s
     }'
 }
 

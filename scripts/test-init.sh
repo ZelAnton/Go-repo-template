@@ -19,6 +19,14 @@ assert_contains() {
   grep -Fq -- "$needle" "$file" || fail "expected '$needle' in $file"
 }
 
+assert_not_contains() {
+  local needle="$1"
+  local file="$2"
+  if grep -Fq -- "$needle" "$file"; then
+    fail "did not expect '$needle' in $file"
+  fi
+}
+
 assert_unchanged_after_rejection() {
   local copy="$1"
   test -f "$copy/TEMPLATE.md" || fail "rejected initialization removed TEMPLATE.md"
@@ -136,13 +144,43 @@ run_valid_test() {
   fi
 }
 
+run_non_recursive_substitution_test() {
+  local initializer="$1"
+  local copy="$tmp_root/non-recursive-$initializer"
+  local unsafe_description='$(echo unsafe-description)'
+  local year=2026
+  if [ "$initializer" = sh ]; then
+    year='$(echo unsafe-year)'
+  fi
+  copy_template "$copy"
+  if [ "$initializer" = sh ]; then
+    bash "$copy/scripts/init.sh" --project-name safe.widgets \
+      --author '__Description__' --author-email '__Year__@example.com' \
+      --github-owner acme --description "$unsafe_description" --year "$year" --keep-script
+  else
+    pwsh -NoLogo -NoProfile -File "$copy/scripts/init.ps1" \
+      -ProjectName safe.widgets -Author '__Description__' -AuthorEmail '__Year__@example.com' \
+      -GitHubOwner acme -Description "$unsafe_description" -Year "$year" -KeepScript
+  fi >"$tmp_root/non-recursive-$initializer.log"
+
+  assert_contains "Copyright (c) $year __Description__" "$copy/LICENSE"
+  assert_contains 'git config user.name "__Description__"' "$copy/.github/workflows/release.yml"
+  assert_contains 'git config user.email "__Year__@example.com"' "$copy/.github/workflows/release.yml"
+  assert_contains "$unsafe_description" "$copy/README.md"
+  assert_not_contains "$unsafe_description" "$copy/.github/workflows/release.yml"
+  assert_not_contains "$year" "$copy/.github/workflows/release.yml"
+  assert_not_contains "$unsafe_description" "$copy/LICENSE"
+}
+
 bash -n "$script_dir/init.sh"
 run_valid_test sh
+run_non_recursive_substitution_test sh
 run_rejection_test sh
 run_owner_rejection_test sh
 
 if command -v pwsh >/dev/null 2>&1; then
   run_valid_test ps1
+  run_non_recursive_substitution_test ps1
   run_rejection_test ps1
   run_owner_rejection_test ps1
 else

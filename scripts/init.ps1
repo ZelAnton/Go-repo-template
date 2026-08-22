@@ -133,6 +133,11 @@ $replacements = [ordered]@{
     '__Description__' = $Description
     '__Year__'        = "$Year"
 }
+$tokenPattern = '__ProjectName__|__GoPackage__|__Author__|__AuthorEmail__|__GitHubOwner__|__Description__|__Year__'
+$tokenEvaluator = [System.Text.RegularExpressions.MatchEvaluator]{
+    param([System.Text.RegularExpressions.Match]$match)
+    $replacements[$match.Value]
+}
 
 # Binary files carry no tokens; reading/rewriting them as text would corrupt them.
 $binaryExtensions = @('.png', '.jpg', '.jpeg', '.gif', '.ico', '.zip')
@@ -165,10 +170,9 @@ $contentChanged = 0
 foreach ($file in $files) {
     if ($binaryExtensions -contains $file.Extension) { continue }
     $text = [System.IO.File]::ReadAllText($file.FullName)
-    $new = $text
-    foreach ($key in $replacements.Keys) {
-        $new = $new.Replace($key, $replacements[$key])
-    }
+    # Match only the original source text. Replacement values are emitted by
+    # the evaluator and are never rescanned for additional tokens.
+    $new = [regex]::Replace($text, $tokenPattern, $tokenEvaluator)
     if ($new -ne $text) {
         # UTF-8 without BOM, LF preserved — matches .gitattributes (eol=lf).
         [System.IO.File]::WriteAllText($file.FullName, $new, (New-Object System.Text.UTF8Encoding($false)))
