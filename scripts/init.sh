@@ -6,7 +6,8 @@
 # Replaces the placeholder tokens (__ProjectName__, __GoPackage__, __Author__,
 # __AuthorEmail__, __GitHubOwner__, __Description__, __Year__) in file contents AND
 # in file/folder names, then removes the template-only files (TEMPLATE.md,
-# docs/AGENT-INIT-GUIDE.md) and — unless --keep-script — both initializers.
+# docs/AGENT-INIT-GUIDE.md and the disposable initializer test harness) and —
+# unless --keep-script — both initializers.
 #
 # Usage:
 #   bash ./scripts/init.sh --project-name my-widgets \
@@ -88,6 +89,7 @@ script_dir="$(cd "$(dirname "$0")" && pwd)"
 repo_root="$(cd "$script_dir/.." && pwd)"
 self="$script_dir/$(basename "$0")"
 sibling_ps1="$script_dir/init.ps1"
+test_harness="$script_dir/test-init.sh"
 
 echo "==> Initializing template as '$slug' (package '$go_package')"
 
@@ -118,18 +120,26 @@ substitute_tokens() {
     }'
 }
 
-# 1) Replace tokens in file contents. Both initializers are skipped: they carry the
-#    literal token strings as search keys, so substituting inside them would corrupt
-#    the sibling script.
+# 1) Replace tokens in file contents. Both initializers and their test harness are
+#    skipped: they carry literal token strings as search keys and fixtures.
 changed=0
 while IFS= read -r -d '' file; do
   case "$file" in
-    "$self"|"$sibling_ps1") continue ;;
+    "$self"|"$sibling_ps1"|"$test_harness") continue ;;
   esac
-  # Skip binary files (NUL bytes get stripped through command substitution).
-  case "$file" in
-    *.png|*.jpg|*.jpeg|*.gif|*.ico|*.zip) continue ;;
+  # Substitute only supported UTF-8 text formats. Unknown asset types stay
+  # byte-for-byte untouched instead of relying on a binary extension denylist.
+  name="$(basename "$file" | tr '[:upper:]' '[:lower:]')"
+  case "$name" in
+    .editorconfig|.gitattributes|.gitignore|codeowners|dockerfile|license|makefile|\
+    *.bat|*.cmd|*.go|*.json|*.md|*.mod|*.ps1|*.psd1|*.psm1|*.sh|*.sum|\
+    *.template|*.toml|*.txt|*.yaml|*.yml) ;;
+    *) continue ;;
   esac
+  # Skip mixed content before command substitution can strip embedded NUL bytes.
+  if ! LC_ALL=C tr -d '\000' < "$file" | cmp -s - "$file"; then
+    continue
+  fi
   # Preserve trailing newlines: append a sentinel before capture, strip it after.
   content="$(cat "$file"; printf x)"; content="${content%x}"
   new="$(TPL_SRC="$content" TPL_PROJECT="$slug" TPL_PACKAGE="$go_package" \
@@ -180,6 +190,7 @@ echo "     pkg.go.dev pick it up). Delete .github/workflows/release.yml if not p
 echo "  6. Fill the Architecture section of CLAUDE.md, then commit."
 
 # 5) Remove both initializers unless asked to keep them.
+rm -f "$test_harness"
 if [ "$keep_script" -ne 1 ]; then
   rm -f "$sibling_ps1"
   rm -f "$self"

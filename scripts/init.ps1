@@ -9,8 +9,8 @@
     Replaces the placeholder tokens (__ProjectName__, __GoPackage__, __Author__,
     __AuthorEmail__, __GitHubOwner__, __Description__, __Year__) in file contents
     AND in file/folder names, then removes the template-only files (TEMPLATE.md,
-    docs/AGENT-INIT-GUIDE.md, and — unless -KeepScript — both initializers,
-    init.ps1 and init.sh).
+    docs/AGENT-INIT-GUIDE.md, and the disposable initializer test harness) and —
+    unless -KeepScript — both initializers, init.ps1 and init.sh.
 
     Run it once, right after creating a repository from the template:
 
@@ -48,7 +48,7 @@
 
 .PARAMETER KeepScript
     Keep both initializers (init.ps1 and init.sh) after running. TEMPLATE.md and
-    docs/AGENT-INIT-GUIDE.md are removed either way.
+    docs/AGENT-INIT-GUIDE.md and the disposable test harness are removed either way.
 
 .EXAMPLE
     pwsh ./scripts/init.ps1 -ProjectName my-widgets -Author "Jane Doe" -GitHubOwner acme -Description "A small module"
@@ -112,8 +112,18 @@ $replacements = [ordered]@{
     '__Year__'        = "$Year"
 }
 
-# Binary files carry no tokens; reading/rewriting them as text would corrupt them.
-$binaryExtensions = @('.png', '.jpg', '.jpeg', '.gif', '.ico', '.zip')
+# Only these UTF-8 text formats participate in content substitution. Unknown asset
+# types stay byte-for-byte untouched instead of relying on an incomplete binary
+# extension denylist.
+$textExtensions = @(
+    '.bat', '.cmd', '.go', '.json', '.md', '.mod', '.ps1', '.psd1', '.psm1',
+    '.sh', '.sum', '.template', '.toml', '.txt', '.yaml', '.yml'
+)
+$textNames = @('.editorconfig', '.gitattributes', '.gitignore', 'codeowners', 'dockerfile', 'license', 'makefile')
+
+# Within supported formats, NUL bytes and invalid UTF-8 still identify binary or
+# mixed content that must not be decoded and rewritten.
+$utf8 = [System.Text.UTF8Encoding]::new($false, $true)
 
 $excludedDirs = @('.git', '.jj', 'vendor')
 
@@ -127,27 +137,37 @@ function Test-Excluded([string]$fullPath) {
 
 Write-Host "==> Initializing template as '$slug' (package '$goPackage')" -ForegroundColor Cyan
 
-# 1) Replace tokens in file contents. Both initializers are skipped: they carry the
-#    literal token strings as search keys, so substituting inside them would corrupt
-#    the sibling script.
+# 1) Replace tokens in file contents. Both initializers and their test harness are
+#    skipped: they carry literal token strings as search keys and fixtures.
 $siblingSh = Join-Path $PSScriptRoot 'init.sh'
+$testHarness = Join-Path $PSScriptRoot 'test-init.sh'
 # -Force includes hidden-attributed files (Windows checkouts sometimes hidden-flag
 # dot-entries) so this pass sees exactly what init.sh's `find` sees; .git/.jj/vendor
 # stay excluded via Test-Excluded.
 $files = Get-ChildItem -Path $repoRoot -File -Recurse -Force | Where-Object {
-    -not (Test-Excluded $_.FullName) -and $_.FullName -ne $selfPath -and $_.FullName -ne $siblingSh
+    -not (Test-Excluded $_.FullName) -and $_.FullName -ne $selfPath -and
+    $_.FullName -ne $siblingSh -and $_.FullName -ne $testHarness
 }
 $contentChanged = 0
 foreach ($file in $files) {
-    if ($binaryExtensions -contains $file.Extension) { continue }
-    $text = [System.IO.File]::ReadAllText($file.FullName)
+    $lowerName = $file.Name.ToLowerInvariant()
+    $lowerExtension = $file.Extension.ToLowerInvariant()
+    if ($textExtensions -notcontains $lowerExtension -and $textNames -notcontains $lowerName) { continue }
+    $bytes = [System.IO.File]::ReadAllBytes($file.FullName)
+    if ([System.Array]::IndexOf($bytes, [byte]0) -ge 0) { continue }
+    try {
+        $text = $utf8.GetString($bytes)
+    }
+    catch [System.Text.DecoderFallbackException] {
+        continue
+    }
     $new = $text
     foreach ($key in $replacements.Keys) {
         $new = $new.Replace($key, $replacements[$key])
     }
     if ($new -ne $text) {
-        # UTF-8 without BOM, LF preserved — matches .gitattributes (eol=lf).
-        [System.IO.File]::WriteAllText($file.FullName, $new, (New-Object System.Text.UTF8Encoding($false)))
+        # Byte encoding, an existing UTF-8 BOM, and line endings are preserved.
+        [System.IO.File]::WriteAllBytes($file.FullName, $utf8.GetBytes($new))
         $contentChanged++
     }
 }
@@ -196,6 +216,7 @@ Write-Host "     pkg.go.dev pick it up). Delete .github/workflows/release.yml if
 Write-Host "  6. Fill the Architecture section of CLAUDE.md, then commit."
 
 # Remove both initializers unless asked to keep them.
+if (Test-Path $testHarness) { Remove-Item -LiteralPath $testHarness -Force }
 if (-not $KeepScript) {
     if (Test-Path $siblingSh) { Remove-Item -LiteralPath $siblingSh -Force }
     Remove-Item -LiteralPath $selfPath -Force

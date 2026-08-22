@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 -
 
 ### Fixed
--
+- Preserve binary files byte-for-byte during template token substitution, including
+  assets with unknown extensions and embedded NUL bytes.
 
 [Unreleased]: https://github.com/__GitHubOwner__/__ProjectName__/commits/main
