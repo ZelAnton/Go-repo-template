@@ -24,5 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unchanged until final cleanup, including when initialization runs from Git Bash.
 - Initializers now preserve an existing `.claude/settings.json` byte-for-byte on
   first run and retry instead of replacing it with the shipped settings template.
+- Preserve binary files byte-for-byte during template token substitution, including
+  assets with unknown extensions, embedded NUL bytes, and invalid UTF-8 text.
 
 [Unreleased]: https://github.com/__GitHubOwner__/__ProjectName__/commits/main

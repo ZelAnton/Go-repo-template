@@ -145,8 +145,17 @@ $tokenEvaluator = [System.Text.RegularExpressions.MatchEvaluator]{
     $replacements[$match.Value]
 }
 
-# Binary files carry no tokens; reading/rewriting them as text would corrupt them.
-$binaryExtensions = @('.png', '.jpg', '.jpeg', '.gif', '.ico', '.zip')
+# Only these UTF-8 text formats participate in content substitution. Unknown asset
+# types stay byte-for-byte untouched instead of relying on a binary denylist.
+$textExtensions = @(
+    '.bat', '.cmd', '.go', '.json', '.md', '.mod', '.ps1', '.psd1', '.psm1',
+    '.sh', '.sum', '.template', '.toml', '.txt', '.yaml', '.yml'
+)
+$textNames = @('.editorconfig', '.gitattributes', '.gitignore', 'codeowners', 'dockerfile', 'license', 'makefile')
+
+# Within supported formats, NUL bytes and invalid UTF-8 still identify binary or
+# mixed content that must not be decoded and rewritten.
+$utf8 = [System.Text.UTF8Encoding]::new($false, $true)
 $excludedDirs = @('.git', '.jj', 'vendor')
 $excludedTopLevel = $excludedDirs
 $runtimeScripts = @('scripts/init.ps1', 'scripts/init.sh', 'scripts/test-init.sh')
@@ -342,8 +351,8 @@ try {
     Copy-TemplateTree $repoRoot $stageRoot
     Fail-At 'copy'
 
-    # Binary files are never decoded. Runtime scripts are staged byte-for-byte and
-    # stay untouched until final cleanup.
+    # Only strict UTF-8 text in supported formats is decoded. Runtime scripts and
+    # existing user settings stay byte-for-byte untouched until final cleanup.
     $files = Get-ChildItem -Path $stageRoot -File -Recurse -Force | Where-Object {
         -not (Test-Excluded $stageRoot $_.FullName) -and
         -not (Test-RuntimeScript $stageRoot $_.FullName) -and
@@ -351,14 +360,23 @@ try {
     }
     $contentChanged = 0
     foreach ($file in $files) {
-        if ($binaryExtensions -contains $file.Extension) { continue }
-        $text = [System.IO.File]::ReadAllText($file.FullName)
+        $lowerName = $file.Name.ToLowerInvariant()
+        $lowerExtension = $file.Extension.ToLowerInvariant()
+        if ($textExtensions -notcontains $lowerExtension -and $textNames -notcontains $lowerName) { continue }
+        $bytes = [System.IO.File]::ReadAllBytes($file.FullName)
+        if ([System.Array]::IndexOf($bytes, [byte]0) -ge 0) { continue }
+        try {
+            $text = $utf8.GetString($bytes)
+        }
+        catch [System.Text.DecoderFallbackException] {
+            continue
+        }
         # Match only the original source text. Replacement values are emitted by
         # the evaluator and are never rescanned for additional tokens.
         $new = [regex]::Replace($text, $tokenPattern, $tokenEvaluator)
         if ($new -ne $text) {
-            # UTF-8 without BOM, LF preserved — matches .gitattributes (eol=lf).
-            [System.IO.File]::WriteAllText($file.FullName, $new, (New-Object System.Text.UTF8Encoding($false)))
+            # UTF-8 BOM presence and line endings survive the decode/encode cycle.
+            [System.IO.File]::WriteAllBytes($file.FullName, $utf8.GetBytes($new))
             $contentChanged++
         }
     }

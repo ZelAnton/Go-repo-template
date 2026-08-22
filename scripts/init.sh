@@ -125,6 +125,12 @@ test_harness="$script_dir/test-init.sh"
 parent_root="$(dirname "$repo_root")"
 transaction_prefix=".$(basename "$repo_root").init-backup"
 
+# Fail closed before recovery or staging if strict UTF-8 validation is unavailable.
+# POSIX and Git Bash provide iconv; continuing without it could rewrite invalid
+# byte sequences that the PowerShell initializer preserves.
+utf8_validator="$(command -v iconv 2>/dev/null || true)"
+[ -n "$utf8_validator" ] || die "iconv is required for strict UTF-8 validation. Install iconv and rerun."
+
 # TEMPLATE_INIT_FAIL_AT is a disposable-test hook. Preparation failures and a
 # partial evacuation must roll back byte-for-byte; a deliberately interrupted
 # restore must preserve the remaining originals in the reported backup tree.
@@ -359,10 +365,23 @@ while IFS= read -r -d '' file; do
     "$stage_root/scripts/init.sh"|"$stage_root/scripts/init.ps1"|"$stage_root/scripts/test-init.sh") continue ;;
     "$stage_root/.claude/settings.json") continue ;;
   esac
-  # Skip binary files (NUL bytes get stripped through command substitution).
-  case "$file" in
-    *.png|*.jpg|*.jpeg|*.gif|*.ico|*.zip) continue ;;
+  # Substitute only supported UTF-8 text formats. Unknown asset types stay
+  # byte-for-byte untouched instead of relying on a binary extension denylist.
+  name="$(basename "$file" | tr '[:upper:]' '[:lower:]')"
+  case "$name" in
+    .editorconfig|.gitattributes|.gitignore|codeowners|dockerfile|license|makefile|\
+    *.bat|*.cmd|*.go|*.json|*.md|*.mod|*.ps1|*.psd1|*.psm1|*.sh|*.sum|\
+    *.template|*.toml|*.txt|*.yaml|*.yml) ;;
+    *) continue ;;
   esac
+  # Skip mixed content before command substitution can strip embedded NUL bytes.
+  if ! LC_ALL=C tr -d '\000' < "$file" | cmp -s - "$file"; then
+    continue
+  fi
+  # Reject malformed UTF-8 before bytes enter shell/environment variables.
+  if ! "$utf8_validator" -f UTF-8 -t UTF-8 "$file" >/dev/null 2>&1; then
+    continue
+  fi
   # Preserve trailing newlines: append a sentinel before capture, strip it after.
   content="$(cat "$file"; printf x)"; content="${content%x}"
   new="$(TPL_SRC="$content" TPL_PROJECT="$slug" TPL_PACKAGE="$go_package" \
