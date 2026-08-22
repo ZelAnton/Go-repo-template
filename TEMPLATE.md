@@ -47,13 +47,18 @@ release pipeline, and conventions for agents in [CLAUDE.md](CLAUDE.md) /
    (lowercase, alphanumerics only; e.g. `acmewidgets`) used in the `package`
    declarations. Name your GitHub repository with the slug the script prints (or edit
    `go.mod`'s module path to match your real remote). The script also activates
-   `.claude/settings.json` from its `.template` form, deletes this `TEMPLATE.md` and
-   `docs/AGENT-INIT-GUIDE.md`, and (unless `-KeepScript` / `--keep-script`) removes
-   **both** initializers (`check-env.{ps1,sh}` stay — they double as a contributor
-   onboarding check).
+   `.claude/settings.json` from its `.template` form, deletes this `TEMPLATE.md`,
+   `docs/AGENT-INIT-GUIDE.md`, and the disposable `scripts/test-init.sh`, and
+   (unless `-KeepScript` / `--keep-script`) removes **both** initializers
+   (`check-env.{ps1,sh}` stay — they double as a contributor onboarding check).
+   Both initializers validate all release identity inputs before changing any files:
+   `GitHubOwner` / `--github-owner` must be 1–39 ASCII letters, digits, or interior
+   hyphens, and the author and email values must not contain control characters or
+   shell/YAML syntax characters. Re-run with corrected values if validation fails.
 4. Verify:
 
    ```sh
+   bash ./scripts/test-init.sh
    go build ./...
    go test ./...
    ```

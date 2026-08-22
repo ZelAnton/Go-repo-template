@@ -6,7 +6,8 @@
 # Replaces the placeholder tokens (__ProjectName__, __GoPackage__, __Author__,
 # __AuthorEmail__, __GitHubOwner__, __Description__, __Year__) in file contents AND
 # in file/folder names, then removes the template-only files (TEMPLATE.md,
-# docs/AGENT-INIT-GUIDE.md) and — unless --keep-script — both initializers.
+# docs/AGENT-INIT-GUIDE.md, scripts/test-init.sh) and — unless --keep-script —
+# both initializers.
 #
 # Usage:
 #   bash ./scripts/init.sh --project-name my-widgets \
@@ -84,47 +85,79 @@ fi
 [ -n "$description" ]  || description="TODO: project description"
 [ -n "$year" ]         || year="$(date +%Y)"
 
+validate_release_value() {
+  local parameter_name="$1"
+  local value="$2"
+  [ -n "$value" ] || die "invalid --$parameter_name. It must not be empty or contain control characters (including quotes, backslashes, or newlines)."
+
+  case "$value" in
+    *$'\n'*|*$'\r'*|*$'\t'*)
+      die "invalid --$parameter_name. It must not be empty or contain control characters (including quotes, backslashes, or newlines)."
+      ;;
+  esac
+  # Consume the complete stream: grep -q can close the pipe early, causing
+  # printf to receive SIGPIPE and making pipefail hide a matching control byte.
+  if printf '%s' "$value" | LC_ALL=C grep '[[:cntrl:]]' >/dev/null; then
+    die "invalid --$parameter_name. It must not be empty or contain control characters (including quotes, backslashes, or newlines)."
+  fi
+  # These characters could terminate the workflow's POSIX shell/YAML string or
+  # introduce expansion. Single quotes remain valid in the surrounding shell
+  # double-quoted value, so ordinary names such as O'Connor are accepted.
+  case "$value" in
+    *'"'*|*'\'*|*'$'*|*'`'*|*';'*|*'&'*|*'|'*|*'<'*|*'>'*|*'('*|*')'*|*'{'*|*'}'*|*'['*|*']'*|*'!'*|*'*'*|*'?'*)
+      die "invalid --$parameter_name '$value'. It contains a character that is unsafe in the generated release workflow."
+      ;;
+  esac
+}
+
+validate_release_value "author" "$author"
+validate_release_value "author-email" "$author_email"
+validate_release_value "github-owner" "$github_owner"
+[[ "$author_email" =~ ^[^@[:space:]]+@[^@[:space:]]+$ ]] || die "invalid --author-email '$author_email'. Supply an email address such as you@example.com."
+[[ "$github_owner" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,37}[A-Za-z0-9])?$ ]] || die "invalid --github-owner '$github_owner'. It must be 1-39 ASCII letters, digits, or interior hyphens."
+
 script_dir="$(cd "$(dirname "$0")" && pwd)"
 repo_root="$(cd "$script_dir/.." && pwd)"
 self="$script_dir/$(basename "$0")"
 sibling_ps1="$script_dir/init.ps1"
+test_harness="$script_dir/test-init.sh"
 
 echo "==> Initializing template as '$slug' (package '$go_package')"
 
 # Literal, backslash-safe token replacement via awk ENVIRON: it does no escape
-# processing and no record splitting, so backslashes and trailing newlines in any
-# value survive intact (unlike bash's ${var//pat/repl}). Go has no quoted-string
-# manifest fields for these values, so no per-file-type escaping is needed.
+# processing and no record splitting. Author and email have already been checked
+# for the shell/YAML context used by release.yml; the remaining values are either
+# derived identifiers or plain-text fields.
 substitute_tokens() {
   awk '
-    function repl(s, tok, val,   out, i) {
-      out = ""
-      while ((i = index(s, tok)) > 0) {
-        out = out substr(s, 1, i - 1) val
-        s = substr(s, i + length(tok))
-      }
-      return out s
+    function replacement(token) {
+      if (token == "__ProjectName__") return ENVIRON["TPL_PROJECT"]
+      if (token == "__GoPackage__") return ENVIRON["TPL_PACKAGE"]
+      if (token == "__Author__") return ENVIRON["TPL_AUTHOR"]
+      if (token == "__AuthorEmail__") return ENVIRON["TPL_AUTHOR_EMAIL"]
+      if (token == "__GitHubOwner__") return ENVIRON["TPL_OWNER"]
+      if (token == "__Description__") return ENVIRON["TPL_DESC"]
+      return ENVIRON["TPL_YEAR"]
     }
     BEGIN {
       s = ENVIRON["TPL_SRC"]
-      s = repl(s, "__ProjectName__", ENVIRON["TPL_PROJECT"])
-      s = repl(s, "__GoPackage__",   ENVIRON["TPL_PACKAGE"])
-      s = repl(s, "__Author__",      ENVIRON["TPL_AUTHOR"])
-      s = repl(s, "__AuthorEmail__", ENVIRON["TPL_AUTHOR_EMAIL"])
-      s = repl(s, "__GitHubOwner__", ENVIRON["TPL_OWNER"])
-      s = repl(s, "__Description__", ENVIRON["TPL_DESC"])
-      s = repl(s, "__Year__",        ENVIRON["TPL_YEAR"])
-      printf "%s", s
+      out = ""
+      while (match(s, /__ProjectName__|__GoPackage__|__Author__|__AuthorEmail__|__GitHubOwner__|__Description__|__Year__/)) {
+        token = substr(s, RSTART, RLENGTH)
+        out = out substr(s, 1, RSTART - 1) replacement(token)
+        s = substr(s, RSTART + RLENGTH)
+      }
+      printf "%s%s", out, s
     }'
 }
 
-# 1) Replace tokens in file contents. Both initializers are skipped: they carry the
-#    literal token strings as search keys, so substituting inside them would corrupt
-#    the sibling script.
+# 1) Replace tokens in file contents. Both initializers and the disposable test
+#    harness are skipped: they carry literal token strings as search keys, and the
+#    harness is removed as a template-only file below.
 changed=0
 while IFS= read -r -d '' file; do
   case "$file" in
-    "$self"|"$sibling_ps1") continue ;;
+    "$self"|"$sibling_ps1"|"$test_harness") continue ;;
   esac
   # Skip binary files (NUL bytes get stripped through command substitution).
   case "$file" in
@@ -166,7 +199,7 @@ if [ -f "$repo_root/.claude/settings.json.template" ]; then
 fi
 
 # 4) Remove template-only files.
-rm -f "$repo_root/TEMPLATE.md" "$repo_root/docs/AGENT-INIT-GUIDE.md"
+rm -f "$repo_root/TEMPLATE.md" "$repo_root/docs/AGENT-INIT-GUIDE.md" "$test_harness"
 rmdir "$repo_root/docs" 2>/dev/null || true
 
 echo ""

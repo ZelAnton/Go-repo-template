@@ -9,8 +9,8 @@
     Replaces the placeholder tokens (__ProjectName__, __GoPackage__, __Author__,
     __AuthorEmail__, __GitHubOwner__, __Description__, __Year__) in file contents
     AND in file/folder names, then removes the template-only files (TEMPLATE.md,
-    docs/AGENT-INIT-GUIDE.md, and — unless -KeepScript — both initializers,
-    init.ps1 and init.sh).
+    docs/AGENT-INIT-GUIDE.md, scripts/test-init.sh, and — unless -KeepScript —
+    both initializers, init.ps1 and init.sh).
 
     Run it once, right after creating a repository from the template:
 
@@ -48,7 +48,7 @@
 
 .PARAMETER KeepScript
     Keep both initializers (init.ps1 and init.sh) after running. TEMPLATE.md and
-    docs/AGENT-INIT-GUIDE.md are removed either way.
+    docs/AGENT-INIT-GUIDE.md and scripts/test-init.sh are removed either way.
 
 .EXAMPLE
     pwsh ./scripts/init.ps1 -ProjectName my-widgets -Author "Jane Doe" -GitHubOwner acme -Description "A small module"
@@ -96,12 +96,34 @@ if (-not $AuthorEmail) {
 if (-not $GitHubOwner) { $GitHubOwner = 'your-org' }
 if (-not $Description) { $Description = 'TODO: project description' }
 
+function Assert-SafeReleaseValue([string]$value, [string]$parameterName) {
+    if ([string]::IsNullOrEmpty($value) -or $value -match '[\x00-\x1F\x7F]') {
+        throw "Invalid -$parameterName. It must not be empty or contain control characters (including quotes, backslashes, or newlines)."
+    }
+
+    # These characters could terminate the workflow's POSIX shell/YAML string or
+    # introduce expansion. Single quotes remain valid in the surrounding shell
+    # double-quoted value, so ordinary names such as O'Connor are accepted.
+    if ($value.IndexOfAny([char[]]('"', '\', '$', '`', ';', '&', '|', '<', '>', '(', ')', '{', '}', '[', ']', '!', '*', '?')) -ge 0) {
+        throw "Invalid -$parameterName '$value'. It contains a character that is unsafe in the generated release workflow."
+    }
+}
+
+Assert-SafeReleaseValue $Author 'Author'
+Assert-SafeReleaseValue $AuthorEmail 'AuthorEmail'
+Assert-SafeReleaseValue $GitHubOwner 'GitHubOwner'
+if ($AuthorEmail -notmatch '^[^@\s]+@[^@\s]+$') {
+    throw "Invalid -AuthorEmail '$AuthorEmail'. Supply an email address such as you@example.com."
+}
+if ($GitHubOwner -notmatch '\A[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?\z') {
+    throw "Invalid -GitHubOwner '$GitHubOwner'. It must be 1-39 ASCII letters, digits, or interior hyphens."
+}
+
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $selfPath = $PSCommandPath
 
-# Go has no quoted-string manifest fields for these values (go.mod's module path is
-# the derived slug; author/description land in plain-text files), so substitution
-# uses raw values everywhere — no per-file-type escaping.
+# Author and email are validated for the shell/YAML context used by release.yml;
+# the remaining values are either derived identifiers or plain-text fields.
 $replacements = [ordered]@{
     '__ProjectName__' = $slug
     '__GoPackage__'   = $goPackage
@@ -110,6 +132,11 @@ $replacements = [ordered]@{
     '__GitHubOwner__' = $GitHubOwner
     '__Description__' = $Description
     '__Year__'        = "$Year"
+}
+$tokenPattern = '__ProjectName__|__GoPackage__|__Author__|__AuthorEmail__|__GitHubOwner__|__Description__|__Year__'
+$tokenEvaluator = [System.Text.RegularExpressions.MatchEvaluator]{
+    param([System.Text.RegularExpressions.Match]$match)
+    $replacements[$match.Value]
 }
 
 # Binary files carry no tokens; reading/rewriting them as text would corrupt them.
@@ -127,24 +154,25 @@ function Test-Excluded([string]$fullPath) {
 
 Write-Host "==> Initializing template as '$slug' (package '$goPackage')" -ForegroundColor Cyan
 
-# 1) Replace tokens in file contents. Both initializers are skipped: they carry the
-#    literal token strings as search keys, so substituting inside them would corrupt
-#    the sibling script.
+# 1) Replace tokens in file contents. Both initializers and the disposable test
+#    harness are skipped: they carry literal token strings as search keys, and the
+#    harness is removed as a template-only file below.
 $siblingSh = Join-Path $PSScriptRoot 'init.sh'
+$testHarness = Join-Path $PSScriptRoot 'test-init.sh'
 # -Force includes hidden-attributed files (Windows checkouts sometimes hidden-flag
 # dot-entries) so this pass sees exactly what init.sh's `find` sees; .git/.jj/vendor
 # stay excluded via Test-Excluded.
 $files = Get-ChildItem -Path $repoRoot -File -Recurse -Force | Where-Object {
-    -not (Test-Excluded $_.FullName) -and $_.FullName -ne $selfPath -and $_.FullName -ne $siblingSh
+    -not (Test-Excluded $_.FullName) -and $_.FullName -ne $selfPath -and
+    $_.FullName -ne $siblingSh -and $_.FullName -ne $testHarness
 }
 $contentChanged = 0
 foreach ($file in $files) {
     if ($binaryExtensions -contains $file.Extension) { continue }
     $text = [System.IO.File]::ReadAllText($file.FullName)
-    $new = $text
-    foreach ($key in $replacements.Keys) {
-        $new = $new.Replace($key, $replacements[$key])
-    }
+    # Match only the original source text. Replacement values are emitted by
+    # the evaluator and are never rescanned for additional tokens.
+    $new = [regex]::Replace($text, $tokenPattern, $tokenEvaluator)
     if ($new -ne $text) {
         # UTF-8 without BOM, LF preserved — matches .gitattributes (eol=lf).
         [System.IO.File]::WriteAllText($file.FullName, $new, (New-Object System.Text.UTF8Encoding($false)))
@@ -174,7 +202,7 @@ if (Test-Path $claudeTemplate) {
 }
 
 # 4) Remove template-only files.
-$templateOnly = @('TEMPLATE.md', 'docs/AGENT-INIT-GUIDE.md')
+$templateOnly = @('TEMPLATE.md', 'docs/AGENT-INIT-GUIDE.md', 'scripts/test-init.sh')
 foreach ($rel in $templateOnly) {
     $p = Join-Path $repoRoot $rel
     if (Test-Path $p) { Remove-Item -LiteralPath $p -Force }

@@ -66,8 +66,8 @@ Confirm these facts by reading, not by assuming:
 
    `-ProjectName` is required; the rest fall back to sensible defaults. The script
    derives the module slug + Go package id, substitutes tokens, activates
-   `.claude/settings.json` from its `.template`, and deletes `TEMPLATE.md` (and itself
-   unless `-KeepScript`).
+   `.claude/settings.json` from its `.template`, and deletes `TEMPLATE.md`, this guide,
+   and the disposable `scripts/test-init.sh` (and itself unless `-KeepScript`).
 4. **Verify**: `go build ./...` then `go test ./...`.
 5. Replace the placeholder `Greet` function with the real API, delete or rewrite the
    sample test, fill in the `CLAUDE.md` "Architecture" section, and work through the
