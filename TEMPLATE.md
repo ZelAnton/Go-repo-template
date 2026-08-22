@@ -29,6 +29,16 @@ release pipeline, and conventions for agents in [CLAUDE.md](CLAUDE.md) /
    required is missing it lists the install commands for your OS and exits non-zero —
    install what it names, then re-run it. **Don't run init until it reports the
    environment is ready.**
+
+   Template maintainers can also run the disposable initializer harness before
+   initialization:
+
+   ```bash
+   bash ./scripts/test-init.sh
+   ```
+
+   The initializer deletes this harness even when `-KeepScript` / `--keep-script`
+   is used, so it is not a generated-repository verification step.
 3. Run the init script once to stamp your project name in. Use whichever matches
    your shell — both do the same thing:
 
@@ -65,7 +75,6 @@ release pipeline, and conventions for agents in [CLAUDE.md](CLAUDE.md) /
 4. Verify:
 
    ```sh
-   bash ./scripts/test-init.sh
    go build ./...
    go test ./...
    ```

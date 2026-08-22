@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 -
 
 ### Fixed
+- Corrected post-initialization guidance to use only checks that survive template cleanup.
 - Initializers now validate release identity values before mutation, preventing unsafe workflow text and invalid GitHub owner segments in generated modules.
 - Initializers now perform token substitution in one pass, preserving token-shaped author and email values when descriptions or years contain replacement text.
 - Made PowerShell and POSIX template initialization failure-safe with staged changes,
