@@ -15,10 +15,18 @@ create_fixture() {
   mkdir -p "$case_root/scripts" "$case_root/fixtures"
   cp "$script_dir/init.sh" "$script_dir/init.ps1" "$script_dir/test-init.sh" "$case_root/scripts/"
 
-  # Unknown extension, embedded NUL, invalid UTF-8, and a token-shaped byte run.
-  # Any text decoding or substitution would make the comparison below fail.
-  printf '\211BIN\000__ProjectName__\377END' > "$case_root/fixtures/asset.unknown"
-  cp "$case_root/fixtures/asset.unknown" "$case_root/expected-binary"
+  # Unknown extensions remain outside the supported text allowlist even when
+  # their bytes happen to be valid UTF-8 and contain a replacement token.
+  printf 'UNKNOWN__ProjectName__END' > "$case_root/fixtures/asset.unknown"
+  cp "$case_root/fixtures/asset.unknown" "$case_root/expected-unknown"
+
+  # Supported extensions still preserve mixed content containing an embedded NUL.
+  printf 'NUL\000__ProjectName__END' > "$case_root/fixtures/embedded-nul.txt"
+  cp "$case_root/fixtures/embedded-nul.txt" "$case_root/expected-nul"
+
+  # This supported text extension has no NUL but is not valid UTF-8.
+  printf '\377__ProjectName__END' > "$case_root/fixtures/invalid-utf8.txt"
+  cp "$case_root/fixtures/invalid-utf8.txt" "$case_root/expected-invalid-utf8"
 
   # CRLF verifies that substitution does not normalize line endings.
   printf 'project=__ProjectName__\r\npackage=__GoPackage__\r\n' > "$case_root/fixtures/ordinary.txt"
@@ -29,8 +37,16 @@ assert_fixture() {
   local case_root="$1"
   local implementation="$2"
 
-  cmp "$case_root/expected-binary" "$case_root/fixtures/asset.unknown" || {
-    echo "error: $implementation initializer changed unknown binary content" >&2
+  cmp "$case_root/expected-unknown" "$case_root/fixtures/asset.unknown" || {
+    echo "error: $implementation initializer changed unknown-extension content" >&2
+    return 1
+  }
+  cmp "$case_root/expected-nul" "$case_root/fixtures/embedded-nul.txt" || {
+    echo "error: $implementation initializer changed supported-extension NUL content" >&2
+    return 1
+  }
+  cmp "$case_root/expected-invalid-utf8" "$case_root/fixtures/invalid-utf8.txt" || {
+    echo "error: $implementation initializer changed supported-extension invalid UTF-8 content" >&2
     return 1
   }
   cmp "$case_root/expected-text" "$case_root/fixtures/ordinary.txt" || {

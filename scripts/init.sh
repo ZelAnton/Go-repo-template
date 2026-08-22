@@ -91,6 +91,12 @@ self="$script_dir/$(basename "$0")"
 sibling_ps1="$script_dir/init.ps1"
 test_harness="$script_dir/test-init.sh"
 
+# Fail closed before touching the template if strict UTF-8 validation is not
+# available. POSIX and Git Bash provide iconv; continuing without it could rewrite
+# invalid byte sequences that the PowerShell initializer preserves.
+utf8_validator="$(command -v iconv 2>/dev/null || true)"
+[ -n "$utf8_validator" ] || die "iconv is required for strict UTF-8 validation. Install iconv and rerun."
+
 echo "==> Initializing template as '$slug' (package '$go_package')"
 
 # Literal, backslash-safe token replacement via awk ENVIRON: it does no escape
@@ -138,6 +144,10 @@ while IFS= read -r -d '' file; do
   esac
   # Skip mixed content before command substitution can strip embedded NUL bytes.
   if ! LC_ALL=C tr -d '\000' < "$file" | cmp -s - "$file"; then
+    continue
+  fi
+  # Reject malformed UTF-8 before bytes enter shell/environment variables.
+  if ! "$utf8_validator" -f UTF-8 -t UTF-8 "$file" >/dev/null 2>&1; then
     continue
   fi
   # Preserve trailing newlines: append a sentinel before capture, strip it after.
