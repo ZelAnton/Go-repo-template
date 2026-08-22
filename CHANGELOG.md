@@ -14,6 +14,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 -
 
 ### Fixed
--
+- Initializers now validate release identity values before mutation, preventing unsafe workflow text and invalid GitHub owner segments in generated modules.
 
 [Unreleased]: https://github.com/__GitHubOwner__/__ProjectName__/commits/main

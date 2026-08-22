@@ -96,12 +96,33 @@ if (-not $AuthorEmail) {
 if (-not $GitHubOwner) { $GitHubOwner = 'your-org' }
 if (-not $Description) { $Description = 'TODO: project description' }
 
+function Assert-SafeReleaseValue([string]$value, [string]$parameterName) {
+    if ([string]::IsNullOrEmpty($value) -or $value -match '[\x00-\x1F\x7F]') {
+        throw "Invalid -$parameterName. It must not be empty or contain control characters (including quotes, backslashes, or newlines)."
+    }
+
+    # These characters could terminate the workflow's POSIX shell/YAML string or
+    # introduce expansion. Single quotes remain valid in the surrounding shell
+    # double-quoted value, so ordinary names such as O'Connor are accepted.
+    if ($value.IndexOfAny([char[]]('"', '\', '$', '`', ';', '&', '|', '<', '>', '(', ')', '{', '}', '[', ']', '!', '*', '?')) -ge 0) {
+        throw "Invalid -$parameterName '$value'. It contains a character that is unsafe in the generated release workflow."
+    }
+}
+
+Assert-SafeReleaseValue $Author 'Author'
+Assert-SafeReleaseValue $AuthorEmail 'AuthorEmail'
+if ($AuthorEmail -notmatch '^[^@\s]+@[^@\s]+$') {
+    throw "Invalid -AuthorEmail '$AuthorEmail'. Supply an email address such as you@example.com."
+}
+if ($GitHubOwner -notmatch '^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$') {
+    throw "Invalid -GitHubOwner '$GitHubOwner'. It must be 1-39 ASCII letters, digits, or interior hyphens."
+}
+
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $selfPath = $PSCommandPath
 
-# Go has no quoted-string manifest fields for these values (go.mod's module path is
-# the derived slug; author/description land in plain-text files), so substitution
-# uses raw values everywhere — no per-file-type escaping.
+# Author and email are validated for the shell/YAML context used by release.yml;
+# the remaining values are either derived identifiers or plain-text fields.
 $replacements = [ordered]@{
     '__ProjectName__' = $slug
     '__GoPackage__'   = $goPackage
