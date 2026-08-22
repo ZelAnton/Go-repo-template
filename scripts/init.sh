@@ -112,6 +112,7 @@ validate_release_value() {
 
 validate_release_value "author" "$author"
 validate_release_value "author-email" "$author_email"
+validate_release_value "github-owner" "$github_owner"
 [[ "$author_email" =~ ^[^@[:space:]]+@[^@[:space:]]+$ ]] || die "invalid --author-email '$author_email'. Supply an email address such as you@example.com."
 [[ "$github_owner" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,37}[A-Za-z0-9])?$ ]] || die "invalid --github-owner '$github_owner'. It must be 1-39 ASCII letters, digits, or interior hyphens."
 

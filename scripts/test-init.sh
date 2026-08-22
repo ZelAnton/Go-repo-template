@@ -92,6 +92,35 @@ run_rejection_test() {
   assert_unchanged_after_rejection "$copy"
 }
 
+run_owner_rejection_test() {
+  local initializer="$1"
+  local copy="$tmp_root/owner-reject-$initializer"
+  local output="$tmp_root/owner-reject-$initializer.log"
+  local owner control code
+
+  for owner in $'acme\n' $'acme\r\n'; do
+    copy_template "$copy"
+    if run_initializer "$initializer" "$copy" 'Jane Doe' 'safe@example.com' "$owner"; then
+      fail "$initializer accepted a GitHub owner with a trailing newline"
+    fi >"$output" 2>&1
+    assert_contains 'github-owner' "$output"
+    assert_unchanged_after_rejection "$copy"
+  done
+
+  # NUL cannot be passed through an argv; exercise every other C0 control byte
+  # and DEL so both initializers reject the same representable input set.
+  for code in $(seq 1 31) 127; do
+    printf -v control '%b' "\\$(printf '%03o' "$code")"
+    owner="acme${control}"
+    copy_template "$copy"
+    if run_initializer "$initializer" "$copy" 'Jane Doe' 'safe@example.com' "$owner"; then
+      fail "$initializer accepted GitHub owner control byte $code"
+    fi >"$output" 2>&1
+    assert_contains 'github-owner' "$output"
+    assert_unchanged_after_rejection "$copy"
+  done
+}
+
 run_valid_test() {
   local initializer="$1"
   local copy="$tmp_root/valid-$initializer"
@@ -110,10 +139,12 @@ run_valid_test() {
 bash -n "$script_dir/init.sh"
 run_valid_test sh
 run_rejection_test sh
+run_owner_rejection_test sh
 
 if command -v pwsh >/dev/null 2>&1; then
   run_valid_test ps1
   run_rejection_test ps1
+  run_owner_rejection_test ps1
 else
   echo 'pwsh not found; skipped PowerShell initializer checks.'
 fi

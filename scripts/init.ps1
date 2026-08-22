@@ -111,10 +111,11 @@ function Assert-SafeReleaseValue([string]$value, [string]$parameterName) {
 
 Assert-SafeReleaseValue $Author 'Author'
 Assert-SafeReleaseValue $AuthorEmail 'AuthorEmail'
+Assert-SafeReleaseValue $GitHubOwner 'GitHubOwner'
 if ($AuthorEmail -notmatch '^[^@\s]+@[^@\s]+$') {
     throw "Invalid -AuthorEmail '$AuthorEmail'. Supply an email address such as you@example.com."
 }
-if ($GitHubOwner -notmatch '^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$') {
+if ($GitHubOwner -notmatch '\A[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?\z') {
     throw "Invalid -GitHubOwner '$GitHubOwner'. It must be 1-39 ASCII letters, digits, or interior hyphens."
 }
 
