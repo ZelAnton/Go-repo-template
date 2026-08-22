@@ -6,7 +6,9 @@
 # Replaces the placeholder tokens (__ProjectName__, __GoPackage__, __Author__,
 # __AuthorEmail__, __GitHubOwner__, __Description__, __Year__) in file contents AND
 # in file/folder names, then removes the template-only files (TEMPLATE.md,
-# docs/AGENT-INIT-GUIDE.md) and — unless --keep-script — both initializers.
+# docs/AGENT-INIT-GUIDE.md and the disposable initializer test harness) and —
+# unless --keep-script — both initializers.
+# Changes are prepared in a staging tree and committed with rollback protection.
 #
 # Usage:
 #   bash ./scripts/init.sh --project-name my-widgets \
@@ -88,13 +90,69 @@ script_dir="$(cd "$(dirname "$0")" && pwd)"
 repo_root="$(cd "$script_dir/.." && pwd)"
 self="$script_dir/$(basename "$0")"
 sibling_ps1="$script_dir/init.ps1"
+test_harness="$script_dir/test-init.sh"
+
+# TEMPLATE_INIT_FAIL_AT is a disposable-test hook. It is checked only while the
+# staged tree is being prepared (before the live-tree swap), so an injected error
+# must leave the source tree byte-for-byte unchanged.
+failure_stage="${TEMPLATE_INIT_FAIL_AT:-}"
+stage_root=""
+backup_root=""
+swap_started=0
+swap_complete=0
+original_entries=()
+staged_entries=()
+
+fail_at() {
+  if [ "$failure_stage" = "$1" ]; then
+    die "injected initializer failure at stage '$1'"
+  fi
+}
+
+path_exists() {
+  [ -e "$1" ] || [ -L "$1" ]
+}
+
+rollback_swap() {
+  local entry name
+  for entry in "${staged_entries[@]}"; do
+    name="$(basename "$entry")"
+    if path_exists "$repo_root/$name"; then
+      rm -rf -- "$repo_root/$name"
+    fi
+  done
+  for entry in "${original_entries[@]}"; do
+    name="$(basename "$entry")"
+    if path_exists "$backup_root/$name"; then
+      mv -- "$backup_root/$name" "$repo_root/$name"
+    fi
+  done
+}
+
+cleanup_transaction() {
+  local status=$?
+  trap - EXIT
+  if [ "$swap_complete" -eq 0 ] && [ "$swap_started" -eq 1 ]; then
+    if ! rollback_swap; then
+      echo "error: initializer failed and rollback also failed" >&2
+      status=1
+    fi
+  fi
+  if [ -n "$stage_root" ] && path_exists "$stage_root"; then
+    rm -rf -- "$stage_root" || status=1
+  fi
+  if [ -n "$backup_root" ] && path_exists "$backup_root"; then
+    rm -rf -- "$backup_root" || status=1
+  fi
+  exit "$status"
+}
+trap cleanup_transaction EXIT
 
 echo "==> Initializing template as '$slug' (package '$go_package')"
 
 # Literal, backslash-safe token replacement via awk ENVIRON: it does no escape
 # processing and no record splitting, so backslashes and trailing newlines in any
-# value survive intact (unlike bash's ${var//pat/repl}). Go has no quoted-string
-# manifest fields for these values, so no per-file-type escaping is needed.
+# value survive intact (unlike bash's ${var//pat/repl}).
 substitute_tokens() {
   awk '
     function repl(s, tok, val,   out, i) {
@@ -118,14 +176,23 @@ substitute_tokens() {
     }'
 }
 
-# 1) Replace tokens in file contents. Both initializers are skipped: they carry the
-#    literal token strings as search keys, so substituting inside them would corrupt
-#    the sibling script.
+# Prepare all non-runtime files in an adjacent staged tree. The live scripts
+# directory is excluded because the running initializer may be open on Windows;
+# its template-only test harness and initializers are removed after the swap.
+stage_root="$(mktemp -d "$(dirname "$repo_root")/.$(basename "$repo_root").init-stage.XXXXXXXX")"
+while IFS= read -r -d '' entry; do
+  name="$(basename "$entry")"
+  case "$name" in
+    .git|.jj|vendor|scripts) continue ;;
+  esac
+  cp -a -- "$entry" "$stage_root/"
+done < <(find "$repo_root" -mindepth 1 -maxdepth 1 -print0)
+fail_at copy
+
+# 1) Replace tokens in file contents. The initializer scripts and test harness
+#    remain outside the stage, so their literal search keys cannot be corrupted.
 changed=0
 while IFS= read -r -d '' file; do
-  case "$file" in
-    "$self"|"$sibling_ps1") continue ;;
-  esac
   # Skip binary files (NUL bytes get stripped through command substitution).
   case "$file" in
     *.png|*.jpg|*.jpeg|*.gif|*.ico|*.zip) continue ;;
@@ -140,34 +207,67 @@ while IFS= read -r -d '' file; do
     printf '%s' "$new" > "$file"
     changed=$((changed + 1))
   fi
-done < <(find "$repo_root" -type d \( -name .git -o -name .jj -o -name vendor \) -prune -o -type f -print0)
+done < <(find "$stage_root" -type d \( -name .git -o -name .jj -o -name vendor \) -prune -o -type f -print0)
 echo "    Updated contents in $changed file(s)."
+fail_at content
 
 # 2) Rename files and folders whose name contains the project-name token. -depth
 #    processes children before parents. The flat Go layout has none, but a
 #    cmd/__ProjectName__ adaptation would, so support it.
 while IFS= read -r -d '' item; do
-  case "$item" in
-    */.git/*|*/.jj/*|*/vendor/*) continue ;;
-  esac
   dir="$(dirname "$item")"
   base="$(basename "$item")"
   newbase="${base//__ProjectName__/$slug}"
   if [ "$newbase" != "$base" ]; then
+    if path_exists "$dir/$newbase"; then
+      die "cannot rename '$item': target '$dir/$newbase' already exists"
+    fi
     mv "$item" "$dir/$newbase"
     echo "    Renamed $base -> $newbase"
   fi
-done < <(find "$repo_root" -depth -name '*__ProjectName__*' -print0)
+done < <(find "$stage_root" -depth -name '*__ProjectName__*' -print0)
+fail_at rename
 
-# 3) Activate the Claude Code shared settings.
-if [ -f "$repo_root/.claude/settings.json.template" ]; then
-  mv -f "$repo_root/.claude/settings.json.template" "$repo_root/.claude/settings.json"
+# 3) Activate the Claude Code shared settings in the staged tree.
+if [ -f "$stage_root/.claude/settings.json.template" ]; then
+  mv -f "$stage_root/.claude/settings.json.template" "$stage_root/.claude/settings.json"
   echo "    Activated .claude/settings.json"
 fi
+fail_at activate
 
-# 4) Remove template-only files.
-rm -f "$repo_root/TEMPLATE.md" "$repo_root/docs/AGENT-INIT-GUIDE.md"
-rmdir "$repo_root/docs" 2>/dev/null || true
+# 4) Remove template-only files from the staged tree.
+rm -f "$stage_root/TEMPLATE.md" "$stage_root/docs/AGENT-INIT-GUIDE.md"
+rmdir "$stage_root/docs" 2>/dev/null || true
+fail_at delete
+fail_at remove-scripts
+
+# Commit the prepared tree by moving the mutable top-level entries to an adjacent
+# backup, then moving the staged entries into place. Any error before completion
+# restores the original entries from that backup.
+while IFS= read -r -d '' entry; do
+  name="$(basename "$entry")"
+  case "$name" in
+    .git|.jj|vendor|scripts) continue ;;
+  esac
+  original_entries+=("$entry")
+done < <(find "$repo_root" -mindepth 1 -maxdepth 1 -print0)
+while IFS= read -r -d '' entry; do
+  staged_entries+=("$entry")
+done < <(find "$stage_root" -mindepth 1 -maxdepth 1 -print0)
+backup_root="$(mktemp -d "$(dirname "$repo_root")/.$(basename "$repo_root").init-backup.XXXXXXXX")"
+swap_started=1
+for entry in "${original_entries[@]}"; do
+  mv -- "$entry" "$backup_root/"
+done
+commit_moves=0
+for entry in "${staged_entries[@]}"; do
+  mv -- "$entry" "$repo_root/"
+  commit_moves=$((commit_moves + 1))
+  if [ "$failure_stage" = commit ] && [ "$commit_moves" -eq 1 ]; then
+    die "injected initializer failure at stage 'commit'"
+  fi
+done
+swap_complete=1
 
 echo ""
 echo "Done. Next steps:"
@@ -179,8 +279,11 @@ echo "  5. Releasing: push a vX.Y.Z tag — no secret needed (proxy.golang.org a
 echo "     pkg.go.dev pick it up). Delete .github/workflows/release.yml if not publishing."
 echo "  6. Fill the Architecture section of CLAUDE.md, then commit."
 
-# 5) Remove both initializers unless asked to keep them.
+# These are the only live-tree deletions. They happen after the swap, so a locked
+# file leaves a complete initialized tree that is safe to retry.
 if [ "$keep_script" -ne 1 ]; then
-  rm -f "$sibling_ps1"
+  rm -f "$test_harness" "$sibling_ps1"
   rm -f "$self"
+else
+  rm -f "$test_harness"
 fi

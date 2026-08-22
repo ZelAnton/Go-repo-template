@@ -48,7 +48,9 @@ release pipeline, and conventions for agents in [CLAUDE.md](CLAUDE.md) /
    declarations. Name your GitHub repository with the slug the script prints (or edit
    `go.mod`'s module path to match your real remote). The script also activates
    `.claude/settings.json` from its `.template` form, deletes this `TEMPLATE.md` and
-   `docs/AGENT-INIT-GUIDE.md`, and (unless `-KeepScript` / `--keep-script`) removes
+   `docs/AGENT-INIT-GUIDE.md`, and the disposable initializer test harness. Changes
+   are staged before they are applied, so an initialization error leaves the source
+   tree ready for a retry. Unless `-KeepScript` / `--keep-script`, it also removes
    **both** initializers (`check-env.{ps1,sh}` stay — they double as a contributor
    onboarding check).
 4. Verify:

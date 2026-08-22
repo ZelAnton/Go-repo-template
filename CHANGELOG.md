@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 -
 
 ### Fixed
--
+- Made PowerShell and POSIX template initialization failure-safe with staged changes,
+  rollback protection, and retryable cleanup.
 
 [Unreleased]: https://github.com/__GitHubOwner__/__ProjectName__/commits/main

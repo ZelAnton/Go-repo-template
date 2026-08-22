@@ -65,8 +65,10 @@ Confirm these facts by reading, not by assuming:
    ```
 
    `-ProjectName` is required; the rest fall back to sensible defaults. The script
-   derives the module slug + Go package id, substitutes tokens, activates
-   `.claude/settings.json` from its `.template`, and deletes `TEMPLATE.md` (and itself
+   derives the module slug + Go package id, prepares substitutions, renames, settings,
+   and template-file removals in a staging tree, then applies them with rollback
+   protection. If preparation or the final swap fails, retry the initializer; it does
+   not leave a partially initialized source tree. It deletes `TEMPLATE.md` (and itself
    unless `-KeepScript`).
 4. **Verify**: `go build ./...` then `go test ./...`.
 5. Replace the placeholder `Greet` function with the real API, delete or rewrite the

@@ -9,8 +9,9 @@
     Replaces the placeholder tokens (__ProjectName__, __GoPackage__, __Author__,
     __AuthorEmail__, __GitHubOwner__, __Description__, __Year__) in file contents
     AND in file/folder names, then removes the template-only files (TEMPLATE.md,
-    docs/AGENT-INIT-GUIDE.md, and — unless -KeepScript — both initializers,
-    init.ps1 and init.sh).
+    docs/AGENT-INIT-GUIDE.md, and the disposable initializer test harness) and —
+    unless -KeepScript — both initializers, init.ps1 and init.sh. Changes are
+    prepared in a staging tree and committed with rollback protection.
 
     Run it once, right after creating a repository from the template:
 
@@ -48,7 +49,7 @@
 
 .PARAMETER KeepScript
     Keep both initializers (init.ps1 and init.sh) after running. TEMPLATE.md and
-    docs/AGENT-INIT-GUIDE.md are removed either way.
+    docs/AGENT-INIT-GUIDE.md and the disposable test harness are removed either way.
 
 .EXAMPLE
     pwsh ./scripts/init.ps1 -ProjectName my-widgets -Author "Jane Doe" -GitHubOwner acme -Description "A small module"
@@ -98,6 +99,9 @@ if (-not $Description) { $Description = 'TODO: project description' }
 
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $selfPath = $PSCommandPath
+$siblingSh = Join-Path $PSScriptRoot 'init.sh'
+$testHarness = Join-Path $PSScriptRoot 'test-init.sh'
+$failureStage = $env:TEMPLATE_INIT_FAIL_AT
 
 # Go has no quoted-string manifest fields for these values (go.mod's module path is
 # the derived slug; author/description land in plain-text files), so substitution
@@ -114,89 +118,162 @@ $replacements = [ordered]@{
 
 # Binary files carry no tokens; reading/rewriting them as text would corrupt them.
 $binaryExtensions = @('.png', '.jpg', '.jpeg', '.gif', '.ico', '.zip')
+$excludedTopLevel = @('.git', '.jj', 'vendor', 'scripts')
+$stageRoot = $null
+$backupRoot = $null
+$swapComplete = $false
+$swapStarted = $false
 
-$excludedDirs = @('.git', '.jj', 'vendor')
-
-function Test-Excluded([string]$fullPath) {
-    $rel = $fullPath.Substring($repoRoot.Length).TrimStart('\', '/')
-    foreach ($seg in ($rel -split '[\\/]')) {
-        if ($excludedDirs -contains $seg) { return $true }
+function Fail-At([string]$stage) {
+    if ($failureStage -eq $stage) {
+        throw "Injected initializer failure at stage '$stage'."
     }
-    return $false
+}
+
+function Remove-PathIfPresent([string]$path) {
+    if (Test-Path -LiteralPath $path) {
+        Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction Stop
+    }
+}
+
+function Copy-TemplateTree([string]$sourceRoot, [string]$destinationRoot) {
+    foreach ($item in (Get-ChildItem -LiteralPath $sourceRoot -Force)) {
+        if ($excludedTopLevel -contains $item.Name) { continue }
+        Copy-Item -LiteralPath $item.FullName -Destination $destinationRoot -Recurse -Force -ErrorAction Stop
+    }
+}
+
+function Rollback-Swap([string[]]$originalNames, [string[]]$stagedNames) {
+    foreach ($name in $stagedNames) {
+        Remove-PathIfPresent (Join-Path $repoRoot $name)
+    }
+    foreach ($name in $originalNames) {
+        $saved = Join-Path $backupRoot $name
+        if (Test-Path -LiteralPath $saved) {
+            Move-Item -LiteralPath $saved -Destination $repoRoot -Force -ErrorAction Stop
+        }
+    }
 }
 
 Write-Host "==> Initializing template as '$slug' (package '$goPackage')" -ForegroundColor Cyan
 
-# 1) Replace tokens in file contents. Both initializers are skipped: they carry the
-#    literal token strings as search keys, so substituting inside them would corrupt
-#    the sibling script.
-$siblingSh = Join-Path $PSScriptRoot 'init.sh'
-# -Force includes hidden-attributed files (Windows checkouts sometimes hidden-flag
-# dot-entries) so this pass sees exactly what init.sh's `find` sees; .git/.jj/vendor
-# stay excluded via Test-Excluded.
-$files = Get-ChildItem -Path $repoRoot -File -Recurse -Force | Where-Object {
-    -not (Test-Excluded $_.FullName) -and $_.FullName -ne $selfPath -and $_.FullName -ne $siblingSh
-}
-$contentChanged = 0
-foreach ($file in $files) {
-    if ($binaryExtensions -contains $file.Extension) { continue }
-    $text = [System.IO.File]::ReadAllText($file.FullName)
-    $new = $text
-    foreach ($key in $replacements.Keys) {
-        $new = $new.Replace($key, $replacements[$key])
+try {
+    # Prepare every change outside the live tree. The stage is adjacent to the
+    # repository so the final moves stay on one filesystem and can be rolled back.
+    $parentRoot = Split-Path -Parent $repoRoot
+    $stageRoot = Join-Path $parentRoot ('.' + (Split-Path -Leaf $repoRoot) + '.init-stage-' + [guid]::NewGuid().ToString('N'))
+    $backupRoot = Join-Path $parentRoot ('.' + (Split-Path -Leaf $repoRoot) + '.init-backup-' + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $stageRoot -Force | Out-Null
+    Copy-TemplateTree $repoRoot $stageRoot
+    Fail-At 'copy'
+
+    # Binary files are never decoded. The initializer scripts stay in the live
+    # scripts directory because the current PowerShell process may have the file open.
+    $files = Get-ChildItem -Path $stageRoot -File -Recurse -Force
+    $contentChanged = 0
+    foreach ($file in $files) {
+        if ($binaryExtensions -contains $file.Extension) { continue }
+        $text = [System.IO.File]::ReadAllText($file.FullName)
+        $new = $text
+        foreach ($key in $replacements.Keys) {
+            $new = $new.Replace($key, $replacements[$key])
+        }
+        if ($new -ne $text) {
+            # UTF-8 without BOM, LF preserved — matches .gitattributes (eol=lf).
+            [System.IO.File]::WriteAllText($file.FullName, $new, (New-Object System.Text.UTF8Encoding($false)))
+            $contentChanged++
+        }
     }
-    if ($new -ne $text) {
-        # UTF-8 without BOM, LF preserved — matches .gitattributes (eol=lf).
-        [System.IO.File]::WriteAllText($file.FullName, $new, (New-Object System.Text.UTF8Encoding($false)))
-        $contentChanged++
+    Write-Host "    Updated contents in $contentChanged file(s)." -ForegroundColor DarkGray
+    Fail-At 'content'
+
+    # Rename deepest paths first so child renames do not invalidate parent paths.
+    $named = Get-ChildItem -Path $stageRoot -Recurse -Force | Where-Object {
+        $_.Name -like '*__ProjectName__*'
+    } | Sort-Object { $_.FullName.Length } -Descending
+    foreach ($item in $named) {
+        $newName = $item.Name.Replace('__ProjectName__', $slug)
+        Rename-Item -LiteralPath $item.FullName -NewName $newName -ErrorAction Stop
+        Write-Host "    Renamed $($item.Name) -> $newName" -ForegroundColor DarkGray
+    }
+    Fail-At 'rename'
+
+    # Activate Claude Code shared settings in the staged tree.
+    $claudeTemplate = Join-Path $stageRoot '.claude/settings.json.template'
+    if (Test-Path -LiteralPath $claudeTemplate) {
+        Move-Item -LiteralPath $claudeTemplate -Destination (Join-Path $stageRoot '.claude/settings.json') -Force -ErrorAction Stop
+        Write-Host "    Activated .claude/settings.json" -ForegroundColor DarkGray
+    }
+    Fail-At 'activate'
+
+    # Remove template-only files in the staged tree. A failure here cannot affect
+    # the source tree and the complete operation can be retried unchanged.
+    foreach ($rel in @('TEMPLATE.md', 'docs/AGENT-INIT-GUIDE.md')) {
+        Remove-PathIfPresent (Join-Path $stageRoot $rel)
+    }
+    $stagedDocs = Join-Path $stageRoot 'docs'
+    if ((Test-Path -LiteralPath $stagedDocs) -and -not (Get-ChildItem -LiteralPath $stagedDocs -Force)) {
+        Remove-Item -LiteralPath $stagedDocs -Force -ErrorAction Stop
+    }
+    Fail-At 'delete'
+    Fail-At 'remove-scripts'
+
+    $originalNames = @(
+        Get-ChildItem -LiteralPath $repoRoot -Force |
+            Where-Object { $excludedTopLevel -notcontains $_.Name } |
+            Select-Object -ExpandProperty Name
+    )
+    $stagedNames = @(
+        Get-ChildItem -LiteralPath $stageRoot -Force |
+            Select-Object -ExpandProperty Name
+    )
+    New-Item -ItemType Directory -Path $backupRoot -Force | Out-Null
+    $swapStarted = $true
+    foreach ($name in $originalNames) {
+        Move-Item -LiteralPath (Join-Path $repoRoot $name) -Destination $backupRoot -Force -ErrorAction Stop
+    }
+    $stagedMoves = 0
+    foreach ($name in $stagedNames) {
+        Move-Item -LiteralPath (Join-Path $stageRoot $name) -Destination $repoRoot -Force -ErrorAction Stop
+        $stagedMoves++
+        if ($failureStage -eq 'commit' -and $stagedMoves -eq 1) {
+            throw "Injected initializer failure at stage 'commit'."
+        }
+    }
+    $swapComplete = $true
+
+    Write-Host ""
+    Write-Host "Done. Next steps:" -ForegroundColor Green
+    Write-Host "  1. go build ./... && go test ./..."
+    Write-Host "  2. gofmt -w . && go vet ./..."
+    Write-Host "  3. Review LICENSE (author/year) and the module path in go.mod."
+    Write-Host "  4. Replace greeter.go (and greeter_test.go) with your real API."
+    Write-Host "  5. Releasing: push a vX.Y.Z tag — no secret needed (proxy.golang.org and"
+    Write-Host "     pkg.go.dev pick it up). Delete .github/workflows/release.yml if not publishing."
+    Write-Host "  6. Fill the Architecture section of CLAUDE.md, then commit."
+
+    # These are the only live-tree deletions. They happen after the swap, so a
+    # locked file leaves a complete initialized tree that is safe to retry.
+    if (-not $KeepScript) {
+        if (Test-Path -LiteralPath $testHarness) { Remove-Item -LiteralPath $testHarness -Force -ErrorAction Stop }
+        if (Test-Path -LiteralPath $siblingSh) { Remove-Item -LiteralPath $siblingSh -Force -ErrorAction Stop }
+        Remove-Item -LiteralPath $selfPath -Force -ErrorAction Stop
+    } elseif (Test-Path -LiteralPath $testHarness) {
+        Remove-Item -LiteralPath $testHarness -Force -ErrorAction Stop
     }
 }
-Write-Host "    Updated contents in $contentChanged file(s)." -ForegroundColor DarkGray
-
-# 2) Rename files and folders whose name contains the project-name token.
-#    Deepest paths first so child renames don't invalidate parent paths. The flat
-#    Go layout has none, but a cmd/__ProjectName__ adaptation would, so support it.
-$named = Get-ChildItem -Path $repoRoot -Recurse -Force | Where-Object {
-    -not (Test-Excluded $_.FullName) -and $_.Name -like '*__ProjectName__*'
-} | Sort-Object { $_.FullName.Length } -Descending
-foreach ($item in $named) {
-    $newName = $item.Name.Replace('__ProjectName__', $slug)
-    Rename-Item -LiteralPath $item.FullName -NewName $newName
-    Write-Host "    Renamed $($item.Name) -> $newName" -ForegroundColor DarkGray
+catch {
+    if (-not $swapComplete -and $swapStarted) {
+        try {
+            Rollback-Swap $originalNames $stagedNames
+        }
+        catch {
+            throw "Initializer failed and rollback also failed: $($_.Exception.Message)"
+        }
+    }
+    throw
 }
-
-# 3) Activate Claude Code shared settings from the shipped .template (renames
-#    .claude/settings.json.template -> .claude/settings.json).
-$claudeTemplate = Join-Path $repoRoot '.claude/settings.json.template'
-if (Test-Path $claudeTemplate) {
-    Move-Item -LiteralPath $claudeTemplate -Destination (Join-Path $repoRoot '.claude/settings.json') -Force
-    Write-Host "    Activated .claude/settings.json" -ForegroundColor DarkGray
-}
-
-# 4) Remove template-only files.
-$templateOnly = @('TEMPLATE.md', 'docs/AGENT-INIT-GUIDE.md')
-foreach ($rel in $templateOnly) {
-    $p = Join-Path $repoRoot $rel
-    if (Test-Path $p) { Remove-Item -LiteralPath $p -Force }
-}
-# Drop docs/ if it's now empty.
-$docsDir = Join-Path $repoRoot 'docs'
-if ((Test-Path $docsDir) -and -not (Get-ChildItem -LiteralPath $docsDir -Force)) {
-    Remove-Item -LiteralPath $docsDir -Force
-}
-
-Write-Host ""
-Write-Host "Done. Next steps:" -ForegroundColor Green
-Write-Host "  1. go build ./... && go test ./..."
-Write-Host "  2. gofmt -w . && go vet ./..."
-Write-Host "  3. Review LICENSE (author/year) and the module path in go.mod."
-Write-Host "  4. Replace greeter.go (and greeter_test.go) with your real API."
-Write-Host "  5. Releasing: push a vX.Y.Z tag — no secret needed (proxy.golang.org and"
-Write-Host "     pkg.go.dev pick it up). Delete .github/workflows/release.yml if not publishing."
-Write-Host "  6. Fill the Architecture section of CLAUDE.md, then commit."
-
-# Remove both initializers unless asked to keep them.
-if (-not $KeepScript) {
-    if (Test-Path $siblingSh) { Remove-Item -LiteralPath $siblingSh -Force }
-    Remove-Item -LiteralPath $selfPath -Force
+finally {
+    if ($stageRoot) { Remove-PathIfPresent $stageRoot }
+    if ($backupRoot) { Remove-PathIfPresent $backupRoot }
 }
