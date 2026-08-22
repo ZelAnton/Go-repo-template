@@ -102,6 +102,8 @@ $selfPath = $PSCommandPath
 $siblingSh = Join-Path $PSScriptRoot 'init.sh'
 $testHarness = Join-Path $PSScriptRoot 'test-init.sh'
 $failureStage = $env:TEMPLATE_INIT_FAIL_AT
+$parentRoot = Split-Path -Parent $repoRoot
+$transactionPrefix = '.' + (Split-Path -Leaf $repoRoot) + '.init-backup'
 
 # Go has no quoted-string manifest fields for these values (go.mod's module path is
 # the derived slug; author/description land in plain-text files), so substitution
@@ -119,7 +121,8 @@ $replacements = [ordered]@{
 # Binary files carry no tokens; reading/rewriting them as text would corrupt them.
 $binaryExtensions = @('.png', '.jpg', '.jpeg', '.gif', '.ico', '.zip')
 $excludedDirs = @('.git', '.jj', 'vendor')
-$excludedTopLevel = $excludedDirs + 'scripts'
+$excludedTopLevel = $excludedDirs
+$runtimeScripts = @('scripts/init.ps1', 'scripts/init.sh', 'scripts/test-init.sh')
 $stageRoot = $null
 $backupRoot = $null
 $swapComplete = $false
@@ -153,6 +156,49 @@ function Test-Excluded([string]$root, [string]$fullPath) {
         if ($excludedDirs -contains $segment) { return $true }
     }
     return $false
+}
+
+function Test-RuntimeScript([string]$root, [string]$fullPath) {
+    $relativePath = $fullPath.Substring($root.Length).TrimStart('\', '/').Replace('\', '/')
+    return $runtimeScripts -contains $relativePath
+}
+
+function Restore-UnresolvedBackup {
+    $candidates = @(
+        Get-ChildItem -LiteralPath $parentRoot -Directory -Force |
+            Where-Object { $_.Name.StartsWith($transactionPrefix, [StringComparison]::Ordinal) }
+    )
+    if ($candidates.Count -gt 1) {
+        throw "Found $($candidates.Count) unresolved initializer backups beside '$repoRoot'; refusing to choose one automatically."
+    }
+    if ($candidates.Count -eq 0) { return }
+
+    $candidate = $candidates[0].FullName
+    Write-Host "==> Recovering interrupted rollback from '$candidate'" -ForegroundColor Yellow
+    $recoveredNames = [System.Collections.Generic.List[string]]::new()
+    foreach ($entry in @(Get-ChildItem -LiteralPath $candidate -Force)) {
+        $target = Join-Path $repoRoot $entry.Name
+        if (Test-Path -LiteralPath $target) {
+            throw "Cannot recover '$candidate': restore target '$target' already exists."
+        }
+        try {
+            Move-Item -LiteralPath $entry.FullName -Destination $repoRoot -ErrorAction Stop
+        }
+        catch {
+            throw "Cannot recover '$candidate': failed to restore '$($entry.Name)': $($_.Exception.Message)"
+        }
+        $recoveredNames.Add($entry.Name)
+    }
+
+    foreach ($name in $recoveredNames) {
+        if (-not (Test-Path -LiteralPath (Join-Path $repoRoot $name))) {
+            throw "Cannot verify restored entry '$name'; backup remains at '$candidate'."
+        }
+    }
+    if (Get-ChildItem -LiteralPath $candidate -Force) {
+        throw "Cannot verify that recovery backup '$candidate' is empty."
+    }
+    Remove-Item -LiteralPath $candidate -Force -ErrorAction Stop
 }
 
 function Rollback-Swap {
@@ -192,19 +238,21 @@ function Rollback-Swap {
 Write-Host "==> Initializing template as '$slug' (package '$goPackage')" -ForegroundColor Cyan
 
 try {
+    Restore-UnresolvedBackup
+
     # Prepare every change outside the live tree. The stage is adjacent to the
     # repository so the final moves stay on one filesystem and can be rolled back.
-    $parentRoot = Split-Path -Parent $repoRoot
     $stageRoot = Join-Path $parentRoot ('.' + (Split-Path -Leaf $repoRoot) + '.init-stage-' + [guid]::NewGuid().ToString('N'))
     $backupRoot = Join-Path $parentRoot ('.' + (Split-Path -Leaf $repoRoot) + '.init-backup-' + [guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Path $stageRoot -Force | Out-Null
     Copy-TemplateTree $repoRoot $stageRoot
     Fail-At 'copy'
 
-    # Binary files are never decoded. The initializer scripts stay in the live
-    # scripts directory because the current PowerShell process may have the file open.
+    # Binary files are never decoded. Runtime scripts are staged byte-for-byte and
+    # stay untouched until final cleanup.
     $files = Get-ChildItem -Path $stageRoot -File -Recurse -Force | Where-Object {
-        -not (Test-Excluded $stageRoot $_.FullName)
+        -not (Test-Excluded $stageRoot $_.FullName) -and
+        -not (Test-RuntimeScript $stageRoot $_.FullName)
     }
     $contentChanged = 0
     foreach ($file in $files) {
@@ -225,7 +273,9 @@ try {
 
     # Rename deepest paths first so child renames do not invalidate parent paths.
     $named = Get-ChildItem -Path $stageRoot -Recurse -Force | Where-Object {
-        -not (Test-Excluded $stageRoot $_.FullName) -and $_.Name -like '*__ProjectName__*'
+        -not (Test-Excluded $stageRoot $_.FullName) -and
+        -not (Test-RuntimeScript $stageRoot $_.FullName) -and
+        $_.Name -like '*__ProjectName__*'
     } | Sort-Object { $_.FullName.Length } -Descending
     foreach ($item in $named) {
         $newName = $item.Name.Replace('__ProjectName__', $slug)
@@ -259,6 +309,9 @@ try {
             Where-Object { $excludedTopLevel -notcontains $_.Name } |
             Select-Object -ExpandProperty Name
     )
+    if ($originalNames -contains 'scripts') {
+        $originalNames = @('scripts') + @($originalNames | Where-Object { $_ -ne 'scripts' })
+    }
     $stagedNames = @(
         Get-ChildItem -LiteralPath $stageRoot -Force |
             Select-Object -ExpandProperty Name

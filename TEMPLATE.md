@@ -49,8 +49,11 @@ release pipeline, and conventions for agents in [CLAUDE.md](CLAUDE.md) /
    `go.mod`'s module path to match your real remote). The script also activates
    `.claude/settings.json` from its `.template` form, deletes this `TEMPLATE.md` and
    `docs/AGENT-INIT-GUIDE.md`, and the disposable initializer test harness. Changes
-   are staged before they are applied, so an initialization error leaves the source
-   tree ready for a retry. Unless `-KeepScript` / `--keep-script`, it also removes
+   are staged before they are applied. If rollback is interrupted, a retry first
+   restores and verifies the one unresolved backup beside the repository, removes
+   it, and only then creates a new stage; multiple backups or a restore collision
+   fail closed with recovery details instead of initializing a partial tree. Unless
+   `-KeepScript` / `--keep-script`, it also removes
    **both** initializers (`check-env.{ps1,sh}` stay — they double as a contributor
    onboarding check).
 4. Verify:

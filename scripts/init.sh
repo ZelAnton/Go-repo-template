@@ -91,6 +91,8 @@ repo_root="$(cd "$script_dir/.." && pwd)"
 self="$script_dir/$(basename "$0")"
 sibling_ps1="$script_dir/init.ps1"
 test_harness="$script_dir/test-init.sh"
+parent_root="$(dirname "$repo_root")"
+transaction_prefix=".$(basename "$repo_root").init-backup"
 
 # TEMPLATE_INIT_FAIL_AT is a disposable-test hook. Preparation failures and a
 # partial evacuation must roll back byte-for-byte; a deliberately interrupted
@@ -114,6 +116,39 @@ fail_at() {
 
 path_exists() {
   [ -e "$1" ] || [ -L "$1" ]
+}
+
+recover_unresolved_backup() {
+  local candidates=() backup entry name
+  local recovered_names=()
+
+  while IFS= read -r -d '' backup; do
+    candidates+=("$backup")
+  done < <(find "$parent_root" -mindepth 1 -maxdepth 1 -type d -name "$transaction_prefix*" -print0)
+
+  if [ "${#candidates[@]}" -gt 1 ]; then
+    die "found ${#candidates[@]} unresolved initializer backups beside '$repo_root'; refusing to choose one automatically"
+  fi
+  [ "${#candidates[@]}" -eq 1 ] || return 0
+
+  backup="${candidates[0]}"
+  echo "==> Recovering interrupted rollback from '$backup'"
+  while IFS= read -r -d '' entry; do
+    name="$(basename "$entry")"
+    if path_exists "$repo_root/$name"; then
+      die "cannot recover '$backup': restore target '$repo_root/$name' already exists"
+    fi
+    mv -- "$entry" "$repo_root/$name" || die "cannot recover '$backup': failed to restore '$name'"
+    recovered_names+=("$name")
+  done < <(find "$backup" -mindepth 1 -maxdepth 1 -print0)
+
+  for name in "${recovered_names[@]}"; do
+    path_exists "$repo_root/$name" || die "cannot verify restored entry '$repo_root/$name'; backup remains at '$backup'"
+  done
+  if find "$backup" -mindepth 1 -maxdepth 1 -print -quit | grep -q .; then
+    die "cannot verify that recovery backup '$backup' is empty"
+  fi
+  rmdir -- "$backup" || die "cannot remove verified recovery backup '$backup'"
 }
 
 rollback_swap() {
@@ -177,6 +212,8 @@ cleanup_transaction() {
 }
 trap cleanup_transaction EXIT
 
+recover_unresolved_backup
+
 echo "==> Initializing template as '$slug' (package '$go_package')"
 
 # Literal, backslash-safe token replacement via awk ENVIRON: it does no escape
@@ -205,23 +242,25 @@ substitute_tokens() {
     }'
 }
 
-# Prepare all non-runtime files in an adjacent staged tree. The live scripts
-# directory is excluded because the running initializer may be open on Windows;
-# its template-only test harness and initializers are removed after the swap.
-stage_root="$(mktemp -d "$(dirname "$repo_root")/.$(basename "$repo_root").init-stage.XXXXXXXX")"
+# Prepare all mutable files in an adjacent staged tree. The initializer files and
+# disposable harness are copied byte-for-byte and left untouched until cleanup.
+stage_root="$(mktemp -d "$parent_root/.$(basename "$repo_root").init-stage.XXXXXXXX")"
 while IFS= read -r -d '' entry; do
   name="$(basename "$entry")"
   case "$name" in
-    .git|.jj|vendor|scripts) continue ;;
+    .git|.jj|vendor) continue ;;
   esac
   cp -a -- "$entry" "$stage_root/"
 done < <(find "$repo_root" -mindepth 1 -maxdepth 1 -print0)
 fail_at copy
 
 # 1) Replace tokens in file contents. The initializer scripts and test harness
-#    remain outside the stage, so their literal search keys cannot be corrupted.
+#    remain byte-for-byte copies, so their literal search keys cannot be corrupted.
 changed=0
 while IFS= read -r -d '' file; do
+  case "$file" in
+    "$stage_root/scripts/init.sh"|"$stage_root/scripts/init.ps1"|"$stage_root/scripts/test-init.sh") continue ;;
+  esac
   # Skip binary files (NUL bytes get stripped through command substitution).
   case "$file" in
     *.png|*.jpg|*.jpeg|*.gif|*.ico|*.zip) continue ;;
@@ -246,6 +285,7 @@ fail_at content
 while IFS= read -r -d '' item; do
   case "$item" in
     */.git/*|*/.jj/*|*/vendor/*) continue ;;
+    "$stage_root/scripts/init.sh"|"$stage_root/scripts/init.ps1"|"$stage_root/scripts/test-init.sh") continue ;;
   esac
   dir="$(dirname "$item")"
   base="$(basename "$item")"
@@ -279,14 +319,18 @@ fail_at remove-scripts
 while IFS= read -r -d '' entry; do
   name="$(basename "$entry")"
   case "$name" in
-    .git|.jj|vendor|scripts) continue ;;
+    .git|.jj|vendor) continue ;;
   esac
-  original_entries+=("$entry")
+  if [ "$name" = scripts ]; then
+    original_entries=("$entry" "${original_entries[@]}")
+  else
+    original_entries+=("$entry")
+  fi
 done < <(find "$repo_root" -mindepth 1 -maxdepth 1 -print0)
 while IFS= read -r -d '' entry; do
   staged_entries+=("$entry")
 done < <(find "$stage_root" -mindepth 1 -maxdepth 1 -print0)
-backup_root="$(mktemp -d "$(dirname "$repo_root")/.$(basename "$repo_root").init-backup.XXXXXXXX")"
+backup_root="$(mktemp -d "$parent_root/.$(basename "$repo_root").init-backup.XXXXXXXX")"
 swap_started=1
 for entry in "${original_entries[@]}"; do
   mv -- "$entry" "$backup_root/"

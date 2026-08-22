@@ -33,6 +33,8 @@ copy_template() {
   rm -rf -- "$destination/.git"
   mkdir -p -- "$destination/__ProjectName__-fixtures"
   printf '%s\n' '__ProjectName__' > "$destination/__ProjectName__-fixtures/__ProjectName__.txt"
+  mkdir -p -- "$destination/scripts/__ProjectName__-tool"
+  printf '%s\n' '__ProjectName__' > "$destination/scripts/__ProjectName__-tool/__ProjectName__.txt"
   cp -a -- "$excluded_fixture_expected" "$destination/nested-excluded-fixture"
 }
 
@@ -54,11 +56,19 @@ assert_generated() {
   test ! -e "$copy/docs/AGENT-INIT-GUIDE.md" || fail "agent guide remained"
   test -f "$copy/safe-widgets-fixtures/safe-widgets.txt" || fail "token-named fixture was not renamed"
   grep -Fq -- 'safe-widgets' "$copy/safe-widgets-fixtures/safe-widgets.txt" || fail "fixture content was not substituted"
+  test -f "$copy/scripts/safe-widgets-tool/safe-widgets.txt" || fail "token-named scripts fixture was not renamed"
+  grep -Fq -- 'safe-widgets' "$copy/scripts/safe-widgets-tool/safe-widgets.txt" || fail "scripts fixture content was not substituted"
   if ! diff -r -q -- "$excluded_fixture_expected" "$copy/nested-excluded-fixture" >/dev/null; then
     diff -r -q -- "$excluded_fixture_expected" "$copy/nested-excluded-fixture" >&2 || true
     fail "nested .git/.jj/vendor fixture changed"
   fi
   test ! -e "$copy/scripts/test-init.sh" || fail "test harness remained"
+}
+
+assert_runtime_scripts_unchanged() {
+  local copy="$1"
+  cmp -- "$repo_root/scripts/init.sh" "$copy/scripts/init.sh" >/dev/null || fail "init.sh changed during initialization"
+  cmp -- "$repo_root/scripts/init.ps1" "$copy/scripts/init.ps1" >/dev/null || fail "init.ps1 changed during initialization"
 }
 
 find_transaction_dir() {
@@ -124,6 +134,8 @@ run_failure_stage() {
   # A failed preparation can be retried without restoring the disposable copy.
   run_initializer "$initializer" "$copy" 1 >"$tmp_root/$initializer-$stage-retry.log" 2>&1
   assert_generated "$copy"
+  assert_runtime_scripts_unchanged "$copy"
+  assert_no_transaction_dirs "$copy"
   echo "PASS $initializer failure stage: $stage (rollback + retry)"
 }
 
@@ -132,10 +144,15 @@ run_restore_failure() {
   local copy="$tmp_root/$initializer-restore"
   local baseline="$tmp_root/$initializer-restore-baseline"
   local log="$tmp_root/$initializer-restore.log"
-  local backup recovered reported_backup status
+  local backup expected recovered reported_backup status
 
   copy_template "$copy"
   cp -a -- "$copy" "$baseline"
+  expected="$tmp_root/$initializer-restore-expected"
+  copy_template "$expected"
+  run_initializer "$initializer" "$expected" 1 >"$tmp_root/$initializer-restore-expected.log" 2>&1
+  assert_generated "$expected"
+  assert_runtime_scripts_unchanged "$expected"
   set +e
   TEMPLATE_INIT_FAIL_AT=restore run_initializer "$initializer" "$copy" 1 >"$log" 2>&1
   status=$?
@@ -158,15 +175,17 @@ run_restore_failure() {
   cp -a -- "$backup"/. "$recovered"/
   assert_same_tree "$baseline" "$recovered"
 
-  while IFS= read -r -d '' entry; do
-    mv -- "$entry" "$copy/"
-  done < <(find "$backup" -mindepth 1 -maxdepth 1 -print0)
-  rmdir -- "$backup"
-  assert_same_tree "$baseline" "$copy"
+  # Retry immediately: the initializer must discover, restore, verify, and remove
+  # the sole unresolved backup before preparing a fresh staged tree.
   run_initializer "$initializer" "$copy" 1 >"$tmp_root/$initializer-restore-retry.log" 2>&1
   assert_generated "$copy"
+  assert_runtime_scripts_unchanged "$copy"
+  if ! diff -r -q -- "$expected" "$copy" >/dev/null; then
+    diff -r -q -- "$expected" "$copy" >&2 || true
+    fail "$initializer retry after interrupted restore produced an incomplete tree"
+  fi
   assert_no_transaction_dirs "$copy"
-  echo "PASS $initializer failure stage: restore (preserved backup + recovery + retry)"
+  echo "PASS $initializer failure stage: restore (automatic recovery + retry)"
 }
 
 run_default_cleanup() {
