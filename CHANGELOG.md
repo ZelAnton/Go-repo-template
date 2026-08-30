@@ -11,7 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 -
 
 ### Changed
--
+- The template and generated-repository guidance now use Git directly without secondary version-control metadata.
 
 ### Fixed
 - Corrected post-initialization guidance to use only checks that survive template cleanup.

@@ -21,7 +21,6 @@ In a generated repo, `CLAUDE.md`, `AGENTS.md`, and `.claude/` are local guidance
 printf '\n/CLAUDE.md\n/AGENTS.md\n.claude/\n' >> .gitignore
 git rm -r --cached CLAUDE.md AGENTS.md .claude
 git add .gitignore && git commit -m "Keep agent instructions local"   # commit the ignore rule *and* the removals together
-# jj-colocated: jj file untrack CLAUDE.md AGENTS.md .claude  (folds .gitignore + removals into the working copy; no separate commit)
 ```
 
 `git rm --cached` keeps the files on disk; an ignore rule alone won't untrack already-committed files. `init` deletes `TEMPLATE.md` and `docs/AGENT-INIT-GUIDE.md`, so this section is the surviving copy of the recipe downstream — consult that guide while it exists for precedence details and the caveat that a repo created via GitHub's *Use this template* already carries these files in its initial commit's history (untracking drops them from the tip only).
@@ -121,51 +120,39 @@ git add .gitignore && git commit -m "Keep agent instructions local"   # commit t
 - Minimize comments. Write them only to explain why something exists, an architectural decision, or non-obvious platform/runtime behavior.
 - Do not write comments describing what the code already says.
 
-## Version control (jujutsu)
+## Version control (Git)
 
-This repository uses [jujutsu (`jj`)](https://jj-vcs.github.io/jj/) for version control. The repo is colocated with git, but `jj` is the primary tool — use `jj` commands for everything in this workflow, not raw `git`.
+This repository uses Git directly. Do not initialize or colocate another version-control system in the working tree.
 
-### Describing the current change
+### Starting work
 
-- When you start a new piece of work, set the change description right away:
-	```
-	jj describe -m "Concise summary of what this change does"
-	```
-- For larger work, fold subsequent small edits into the current change without asking — keep extending the same change rather than starting a new one for each follow-up.
-- If the scope of the current change shifts mid-work, refresh the description with another `jj describe -m "..."`.
-
-- **Per-prompt evaluation (mandatory).** Before any edits, run `jj st` and classify the incoming prompt against the current change description:
-
-	| Signal in prompt | Category | Action |
-	|---|---|---|
-	| Same topic, refinement, follow-up of in-progress work | **Continuation** | Just work. jj auto-folds edits into the current change. |
-	| Same change but goal has been refined or expanded | **Scope shift** | `jj describe -m "<refined summary>"`. **Don't** start a new change. |
-	| Orthogonal topic, different area, "теперь сделай X" | **New work** | If current change is finished → `jj new -m "<summary>"` (descendant). If still in progress → `jj new @- -m "..."` (parallel sibling). |
-
-	Reliable signals: "теперь" / "now" / "next" / "также сделай" / "and also" usually mean **new work** or **scope shift**. Imperative follow-ups inside the same scope ("исправь это", "fix this", "продолжи") mean **continuation**. When in doubt, ask the user.
+- Before editing, run `git status --short --branch` and inspect the current branch and any existing changes.
+- Keep refinements and follow-ups for the same task on the current feature branch.
+- Do not mix unrelated work into the same branch or commit. If the working tree is clean, create a short kebab-case feature branch from `origin/main`. If unrelated work arrives while changes are still in progress, ask before stashing, switching branches, or creating another worktree.
+- Preserve user-authored changes and do not amend or rewrite their commits without explicit agreement.
 
 ### Pushing to remote
 
 The user signals "synchronise with remote" with a short trigger word (typically `pull` or `push`). On that signal, run the full sync:
-1. `jj git fetch` — pull down remote movement **before** doing anything else.
-2. If `main@origin` has moved past the local change, rebase onto it: `jj rebase -r @- -d main@origin` (or `jj rebase -d main@origin` for a stack).
-3. Put the work on a **feature bookmark — never advance `main` locally to publish.** First push: `jj bookmark create <topic> -r @` then `jj git push --allow-new -b <topic>`. Later pushes: `jj bookmark move <topic> --to @` then `jj git push -b <topic>`.
-4. Open / update a pull request into `main` (`gh pr create --base main --head <topic> --fill`). `main` advances only when the PR merges; afterwards `jj git fetch` and `jj bookmark delete <topic>`.
+1. `git fetch origin` — pull down remote movement before doing anything else.
+2. Rebase the feature branch onto `origin/main` when the remote branch has advanced: `git rebase origin/main`.
+3. Push the feature branch, never local `main`: use `git push --set-upstream origin HEAD` on the first push and `git push` afterwards.
+4. Open or update a pull request into `main` (`gh pr create --base main --head <topic> --fill`). `main` advances only when the pull request merges; afterwards, fetch, update local `main` with a fast-forward-only pull, and delete the merged feature branch.
 
-Never push without an explicit signal from the user. **Direct-push fallback:** where `main` is unprotected the old single-step flow still works — `jj bookmark move main --to @` then `jj git push -b main`; once PRs are required this is rejected for everyone except the release workflow's GitHub App, which sits in the ruleset's bypass list (`RELEASE_APP_ID` + `RELEASE_APP_PRIVATE_KEY`; see `release-token-bypass.md`).
+Never push without an explicit signal from the user. **Direct-push fallback:** where `main` is unprotected, `git push origin HEAD:main` remains available; once pull requests are required this is rejected for everyone except the release workflow's GitHub App, which sits in the ruleset's bypass list (`RELEASE_APP_ID` + `RELEASE_APP_PRIVATE_KEY`; see `release-token-bypass.md`).
 
 ### Undoing work
 
-- **`jj undo`** (alias of `jj op undo`) — reverses the last operation (describe / edit / squash / rebase / abandon / push). Repeatable.
-- **`jj abandon <rev>`** — drops a specific change entirely; descendants auto-rebase onto its parent.
-- **`jj restore`** — discards working-copy modifications and resets `@` to its parent's tree.
-- **`jj op log`** is the reflog equivalent; `jj op restore <op-id>` jumps to any prior point.
+- **`git restore <path>`** discards selected unstaged changes; use `git restore --staged <path>` to unstage without deleting work.
+- **`git revert <commit>`** reverses a published commit without rewriting shared history.
+- **`git reflog`** locates earlier branch and `HEAD` positions when recovery is needed.
+- Do not use `git reset --hard`, force-push, or rewrite published history without explicit approval.
 
-Never hide a deliberate undo: if the user asks to "undo the last commit/change", run `jj undo` (or `jj abandon`) and tell them what was reverted.
+Never hide a deliberate undo. Tell the user exactly which files or commits were reverted.
 
-### Bookmarks & safety
+### Branches & safety
 
-- Work is published through a **feature bookmark per PR** (short kebab-case topic name), merged into `main` via pull request.
+- Work is published through a **feature branch per pull request** (short kebab-case topic name), merged into `main` via pull request.
 - Do not revert or amend changes the user authored without explicit agreement.
 - Do not rewrite unrelated files when making a focused change.
 

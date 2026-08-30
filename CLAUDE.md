@@ -50,7 +50,7 @@ of [AGENTS.md](AGENTS.md), or `docs/AGENT-INIT-GUIDE.md` while it exists.
 
 ## Version control workflow
 
-The repo uses [jujutsu (`jj`)](https://jj-vcs.github.io/jj/) colocated with git. Use
-`jj` commands. Describe work early (`jj describe -m`), publish through a feature
-bookmark per PR (never advance `main` locally), and sync only on the user's explicit
-`pull`/`push` trigger. Full workflow in [AGENTS.md](AGENTS.md) → "Version control".
+The repo uses Git directly. Do not initialize or colocate another version-control
+system in the working tree. Use a feature branch per pull request (never advance
+`main` locally), and sync only on the user's explicit `pull`/`push` trigger. Full
+workflow in [AGENTS.md](AGENTS.md) → "Version control".

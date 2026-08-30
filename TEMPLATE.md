@@ -90,7 +90,6 @@ release pipeline, and conventions for agents in [CLAUDE.md](CLAUDE.md) /
    printf '\n/CLAUDE.md\n/AGENTS.md\n.claude/\n' >> .gitignore
    git rm -r --cached CLAUDE.md AGENTS.md .claude
    git add .gitignore && git commit -m "Keep agent instructions local"
-   # jj-colocated: jj file untrack CLAUDE.md AGENTS.md .claude
    ```
 
    Appending `.claude/` last makes it win over the earlier `!.claude/...` ship
